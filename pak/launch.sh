@@ -18,7 +18,9 @@ export SDCARD_PATH PLATFORM USERDATA_PATH SHARED_USERDATA_PATH LOGS_PATH
 mkdir -p "$LOGS_PATH"
 
 ABSD="$PAK_DIR/bin/absd"
-export ABSD_LOG="$LOGS_PATH/$PAK_NAME-daemon.txt"
+DAEMON_LOG="$LOGS_PATH/$PAK_NAME-daemon.txt"
+# The UI uses these to restart the daemon if it isn't running.
+export ABSD_BIN="$ABSD" ABSD_LOG_FILE="$DAEMON_LOG"
 
 # Pause and save progress right before the device goes to sleep (NextUI runs
 # *.sync.sh hooks synchronously before suspending).
@@ -31,11 +33,13 @@ exit 0
 EOF
 chmod +x "$HOOK_DIR/audiobookshelf.sync.sh"
 
+# All daemon output (including Go runtime crashes) goes to its log.
 if ! "$ABSD" ctl status >/dev/null 2>&1; then
+	echo "launch.sh: starting $ABSD ($(uname -m), kernel $(uname -r))" >"$DAEMON_LOG"
 	if command -v setsid >/dev/null 2>&1; then
-		setsid "$ABSD" serve </dev/null >/dev/null 2>&1 &
+		setsid "$ABSD" serve </dev/null >>"$DAEMON_LOG" 2>&1 &
 	else
-		nohup "$ABSD" serve </dev/null >/dev/null 2>&1 &
+		nohup "$ABSD" serve </dev/null >>"$DAEMON_LOG" 2>&1 &
 	fi
 fi
 

@@ -14,32 +14,100 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 ap_status_bar_opts g_status_bar = { .show_battery = true, .show_wifi = true };
 
+static bool daemon_up(void) {
+    cJSON *st = absd_status();
+    if (!st) return false;
+    cJSON_Delete(st);
+    return true;
+}
+
+/* Starts absd ourselves, detached, in case launch.sh couldn't. */
+static void spawn_daemon(void) {
+    const char *bin = getenv("ABSD_BIN");
+    char path[1024];
+    if (!bin || !bin[0]) {
+        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 8);
+        if (n <= 0) return;
+        path[n] = '\0';
+        char *slash = strrchr(path, '/');
+        if (!slash) return;
+        strcpy(slash + 1, "absd");
+        bin = path;
+    }
+    const char *logf = getenv("ABSD_LOG_FILE");
+    ap_log("starting player service: %s", bin);
+    pid_t pid = fork();
+    if (pid != 0) return;
+    /* child: new session so it outlives the UI */
+    setsid();
+    int fd = open(logf && logf[0] ? logf : "/dev/null", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        dup2(fd, 1);
+        dup2(fd, 2);
+    }
+    int nul = open("/dev/null", O_RDONLY);
+    if (nul >= 0) dup2(nul, 0);
+    execl(bin, "absd", "serve", (char *)NULL);
+    dprintf(2, "abs-ui: could not exec %s: %s\n", bin, strerror(errno));
+    _exit(127);
+}
+
 static int wait_worker(void *userdata) {
     (void)userdata;
-    for (int i = 0; i < 50; i++) {
-        cJSON *st = absd_status();
-        if (st) {
-            cJSON_Delete(st);
-            return AP_OK;
-        }
+    for (int i = 0; i < 30; i++) { /* launch.sh should have started it */
+        if (daemon_up()) return AP_OK;
+        usleep(100 * 1000);
+    }
+    spawn_daemon();
+    for (int i = 0; i < 80; i++) {
+        if (daemon_up()) return AP_OK;
         usleep(100 * 1000);
     }
     return AP_ERROR;
 }
 
-/* launch.sh starts the daemon just before us; give it a moment. */
-static bool wait_for_daemon(void) {
-    cJSON *st = absd_status();
-    if (st) {
-        cJSON_Delete(st);
-        return true;
+/* Last few lines of the daemon log, for the error screen. */
+static void daemon_log_tail(char *out, size_t len) {
+    out[0] = '\0';
+    const char *logf = getenv("ABSD_LOG_FILE");
+    FILE *f = logf ? fopen(logf, "r") : NULL;
+    if (!f) return;
+    char lines[6][160] = { { 0 } };
+    int n = 0;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), f)) {
+        buf[strcspn(buf, "\r\n")] = '\0';
+        if (!buf[0]) continue;
+        snprintf(lines[n % 6], sizeof(lines[0]), "%.150s", buf);
+        n++;
     }
+    fclose(f);
+    int start = n > 6 ? n - 6 : 0;
+    for (int i = start; i < n; i++) {
+        size_t l = strlen(out);
+        snprintf(out + l, len - l, "%s\n", lines[i % 6]);
+    }
+}
+
+/* launch.sh starts the daemon just before us; give it a moment, then try
+ * starting it ourselves. */
+static bool wait_for_daemon(void) {
+    if (daemon_up()) return true;
     ap_process_opts o = { .message = "Starting..." };
-    return ap_process_message(&o, wait_worker, NULL) == AP_OK;
+    if (ap_process_message(&o, wait_worker, NULL) == AP_OK) return true;
+    char tail[1024], msg[1400];
+    daemon_log_tail(tail, sizeof(tail));
+    snprintf(msg, sizeof(msg), "Couldn't start the player service.\n\n%s\nFull log: .userdata/tg5040/logs/\nAudiobookshelf-daemon.txt",
+             tail[0] ? tail : "(no log output)\n");
+    ap_log("player service failed to start; log tail:\n%s", tail);
+    show_message(msg);
+    return false;
 }
 
 static cJSON *g_libraries; /* cached /libraries response */
@@ -275,9 +343,7 @@ int main(int argc, char *argv[]) {
     }
     power_init();
 
-    if (!wait_for_daemon()) {
-        show_message("Couldn't start the player service.\nCheck .userdata/tg5040/logs/Audiobookshelf-daemon.txt");
-    } else {
+    if (wait_for_daemon()) {
         home_screen();
         exit_choice();
     }

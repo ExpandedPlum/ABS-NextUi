@@ -119,6 +119,15 @@ func serve() {
 		fmt.Println("absd already running")
 		return
 	}
+	// Only one daemon may own the socket and the audio device.
+	lock, err := os.OpenFile(env("ABSD_LOCK", "/tmp/absd.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err == nil {
+		defer lock.Close() // keeps the lock held (and the file reachable) until exit
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			fmt.Println("absd already starting/running (lock held)")
+			return
+		}
+	}
 	if lp := os.Getenv("ABSD_LOG"); lp != "" {
 		if f, err := os.OpenFile(lp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil {
 			log.SetOutput(f)
