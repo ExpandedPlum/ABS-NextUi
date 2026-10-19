@@ -12,13 +12,10 @@ play a game**. Podcasts work too.
 <img src="docs/screenshots/podcast.png" width="49%"> <img src="docs/screenshots/phone-login.png" width="49%">
 </p>
 
-> **Status: v0.2.0, not yet tested on real hardware.** Everything was built
-> with the official NextUI toolchain. The playback service and the device
-> ffmpeg were tested end to end against a real Audiobookshelf server, both
-> natively and under arm64 emulation. The UI was checked visually at the
-> Brick's 1024×768 resolution. Still unverified on a device: backlight
-> control, button codes, and whether audio mixes with game audio. See
-> [Testing on the device](#testing-on-the-device).
+> **Status:** tested on a TrimUI Brick running NextUI. Verified there:
+> streaming and offline playback, screen-off, background playback behind
+> games with game sound muted, in-game buttons, and sleep and shutdown
+> handling.
 
 ## Features
 
@@ -178,22 +175,22 @@ Files on the SD card:
 
 ## Testing on the device
 
-Things that still need confirming on real hardware, in rough priority order:
+A quick check after changes that touch the device side:
 
-1. **Basic playback**: log in, play a book, and check you hear audio. If you
-   don't, check `logs/Audiobookshelf-daemon.txt`.
-2. **Screen off**: a short POWER press should blank the screen with audio
-   continuing, and the next press should restore the previous brightness.
-   The volume buttons should still work while dark.
-3. **Behind a game**: start a book, exit with *Keep listening*, and launch a
-   game. If the book stops, or the game has no sound, the daemon log will
-   show `Audio device is busy`. That means the stock ALSA config doesn't mix
-   streams. Please report it, along with the output of
-   `cat /etc/asound.conf` and `aplay -L`.
-4. **In-game buttons**: check that FN1 toggles playback in a game. The button
-   codes were derived from NextUI's tg5040 input map, not read from hardware.
-5. **Sleep**: put the device to sleep from the NextUI menu; it should pause,
-   and after waking the progress should be on the server.
+1. Play a book. Short-press POWER: the screen goes dark and audio continues.
+   Volume buttons still work; POWER again restores brightness.
+2. Exit with *Keep listening* and start a game. You hear the book and no game
+   sound. FN2 toggles game sound; FN1 pauses/resumes the book (game sound
+   returns while paused).
+3. `adb shell amixer -c audiocodec cget name="'ABS Game Volume'"` shows
+   `values=0,0` while a book plays and `255,255` while it's paused.
+4. Sleep the device during playback: it pauses, and the position reaches the
+   server.
+5. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
+   up within a minute.
+
+Logs: `.userdata/tg5040/logs/Audiobookshelf-daemon.txt` (service) and
+`Audiobookshelf.txt` (UI). `make push` installs a build over adb.
 
 ## Building
 
