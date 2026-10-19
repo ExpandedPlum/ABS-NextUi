@@ -53,7 +53,10 @@ play a game**. Podcasts work too.
 - **Game sound while listening**: games are muted (or turned down) only
   while a book is playing; pause the book and game sound comes back. FN2
   toggles game sound on/off while you listen. The audiobook's volume isn't
-  affected.
+  affected. Works on the speaker, headphones and USB-C audio; not yet over
+  Bluetooth.
+- **USB-C and Bluetooth audio**: plugging in or unplugging moves the book to
+  the new output while it plays.
 - **Quiet app switches**: the book pauses for about 3 seconds whenever a game
   or pak starts or exits, then picks up where it stopped. (Every NextUI app
   sets the speaker to full volume for a moment as it starts.)
@@ -161,9 +164,17 @@ e.g. `"toggle": "FN2,SELECT+Y"`.
   `ABS Game Volume`, in front of the device's default output. It is set in
   `.userdata/tg5040/.asoundrc`, which ALSA reads because NextUI runs
   programs with `HOME` set to that folder. Games use the default output,
-  while the book plays to `Playback` directly. NextUI's `audiomon` owns that
-  file while Bluetooth or USB-C audio is connected; the pak never touches
-  someone else's file, so game volume control is unavailable then.
+  while the book plays to `Playback` directly.
+- **USB-C audio**: NextUI's `audiomon` writes that file when a USB DAC is
+  plugged in, opening the card as a raw `hw` device. Only one program can
+  use that at a time and it does no format conversion, so the book couldn't
+  play next to a game (or at all, on some DACs). The pak replaces the file
+  with one that mixes onto the DAC (`dmix`, with format conversion) and puts
+  the same game volume control in front. It still has a `type hw` line so
+  NextUI recognizes a USB DAC, and `audiomon` deletes it on unplug as before.
+- **Bluetooth audio**: the file is left alone. Emulators open the `bluealsa`
+  device directly rather than the default one, so game volume control isn't
+  available over Bluetooth.
 - A NextUI `pre-sleep.d` hook (`.userdata/tg5040/.hooks/pre-sleep.d/`)
   pauses and syncs before the device suspends.
 - `pre-launch.d` and `post-launch.d` hooks hold the book for 3 seconds
@@ -193,9 +204,12 @@ A quick check after changes that touch the device side:
    `values=0,0` while a book plays and `255,255` while it's paused.
 4. Start and quit a game, and open another pak, while a book plays: the book
    pauses briefly each time and resumes with no loud blip.
-5. Sleep the device during playback: it pauses, and the position reaches the
+5. With a USB-C DAC plugged in, play a book and start a game: the book plays
+   and the game is muted. Unplug during playback: the book moves to the
+   speaker.
+6. Sleep the device during playback: it pauses, and the position reaches the
    server.
-6. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
+7. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
    up within a minute.
 
 Logs: `.userdata/tg5040/logs/Audiobookshelf-daemon.txt` (service) and

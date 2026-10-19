@@ -17,8 +17,15 @@ type GameAudioStatus struct {
 }
 
 // bookDevice is the ALSA device for the book: around the game control when
-// it is installed, otherwise the default (which follows Bluetooth/USB audio).
+// it is installed, otherwise the default (which follows Bluetooth audio). It
+// runs each time playback starts, so it also notes the routing in use.
 func (s *Service) bookDevice() string {
+	if s.game != nil {
+		sig := s.game.Signature()
+		s.sinkMu.Lock()
+		s.sinkSig = sig
+		s.sinkMu.Unlock()
+	}
 	if dev := s.St.GetSettings().AudioDevice; dev != "" && dev != "default" {
 		return dev
 	}
@@ -28,55 +35,47 @@ func (s *Service) bookDevice() string {
 	return s.game.BookDevice()
 }
 
-// reconcileGameAudio runs every tick: keeps the routing installed while the
-// feature is on, and turns games down only while a book is playing.
+// unknownLevel marks the game control's value as unknown (just installed, or
+// left from earlier), so the wanted level is always set.
+const unknownLevel = 1
+
+// reconcileGameAudio runs every tick: keeps the routing in line with the
+// setting and the connected audio, and turns games down only while a book is
+// playing.
 func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 	if s.game == nil {
 		return
 	}
 	level := s.St.GetSettings().GameVolume
+	enabled := level < 0
 	s.gameMu.Lock()
 	defer s.gameMu.Unlock()
 	if s.gameBusy || now.Before(s.gameRetry) {
 		return
 	}
 
-	if level >= 0 {
-		// Feature off: put games back to normal and remove our routing.
-		if s.gameApplied != 0 || s.game.Installed() {
-			s.gameBusy = true
-			go func() {
-				if s.game.Installed() {
-					_ = s.game.SetDB(0)
-				}
-				s.game.Remove()
-				s.gameMu.Lock()
-				s.gameApplied, s.gameBusy, s.gameErr = 0, false, ""
-				s.gameMu.Unlock()
-			}()
-		}
-		return
-	}
-
-	// (Re)install periodically: NextUI deletes the file at boot and
-	// audiomon removes it when Bluetooth/USB audio disconnects.
-	if now.Sub(s.gameChecked) > 5*time.Second || s.gameChecked.IsZero() {
+	// Check every second: NextUI deletes the file at boot, and audiomon
+	// rewrites or deletes it as USB/Bluetooth audio comes and goes.
+	if now.Sub(s.gameChecked) >= time.Second {
 		s.gameChecked = now
-		if !s.game.Installed() {
+		if s.game.Pending(enabled) {
 			s.gameBusy = true
 			go func() {
-				err := s.game.Install()
+				err := s.game.Install(enabled)
 				s.gameMu.Lock()
 				s.gameBusy = false
-				s.gameApplied = 0 // a fresh control starts at full volume
+				s.gameApplied = unknownLevel
 				if err != nil {
+					s.gameRetry = time.Now().Add(5 * time.Second)
 					if s.gameErr != err.Error() {
 						log.Printf("game audio: %v", err)
 					}
 					s.gameErr = err.Error()
 				} else {
 					s.gameErr = ""
-					log.Printf("game audio: routing installed")
+					if s.game.Installed() {
+						log.Printf("game audio: routing installed (book plays to %s)", s.game.BookDevice())
+					}
 				}
 				s.gameMu.Unlock()
 			}()
@@ -84,11 +83,17 @@ func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 		}
 	}
 	if !s.game.Installed() {
+		s.gameErr = ""
+		if enabled {
+			if err := s.game.Unavailable(); err != nil {
+				s.gameErr = err.Error()
+			}
+		}
 		return
 	}
 
 	want := 0
-	if (state == player.StatePlaying || state == player.StateLoading) && !s.gameLetIn {
+	if enabled && (state == player.StatePlaying || state == player.StateLoading) && !s.gameLetIn {
 		want = level
 	}
 	if want == s.gameApplied {
@@ -112,6 +117,38 @@ func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 		}
 		s.gameMu.Unlock()
 	}()
+}
+
+// followSink reopens the book's output when the audio routing changes (USB
+// or Bluetooth audio plugged in or out), so the book moves to the new output
+// instead of staying on the old one, or failing because it went away.
+func (s *Service) followSink(state player.State, now time.Time) {
+	if s.game == nil || now.Sub(s.sinkChecked) < time.Second {
+		return
+	}
+	s.sinkChecked = now
+	if state != player.StatePlaying && state != player.StateError {
+		return
+	}
+	s.gameMu.Lock()
+	settling := s.gameBusy || s.game.Pending(s.St.GetSettings().GameVolume < 0)
+	s.gameMu.Unlock()
+	if settling {
+		return // our routing is about to change; follow it once it has
+	}
+	sig := s.game.Signature()
+	s.sinkMu.Lock()
+	changed := sig != s.sinkSig
+	s.sinkMu.Unlock()
+	if !changed {
+		return
+	}
+	log.Printf("audio output changed; reopening")
+	if state == player.StateError {
+		_ = s.Eng.Play()
+		return
+	}
+	_ = s.Eng.Seek(s.Eng.Position())
 }
 
 // restoreGameAudio puts games back to full volume (on exit).

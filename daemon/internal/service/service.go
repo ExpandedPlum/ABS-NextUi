@@ -79,6 +79,10 @@ type Service struct {
 	gameChecked time.Time
 	gameRetry   time.Time // don't retry a failed volume change before this
 
+	sinkMu      sync.Mutex
+	sinkSig     string // audio routing when the book's output was opened
+	sinkChecked time.Time
+
 	trans *time.Timer // pending resume after an app switch (TransitionPause)
 }
 
@@ -217,6 +221,7 @@ func (s *Service) Run() {
 				state = player.StatePlaying
 			}
 			s.reconcileGameAudio(state, now)
+			s.followSink(snap.State, now)
 			if snap.State == player.StatePlaying || snap.State == player.StateLoading || s.DL.Busy() || s.uiActive() {
 				s.mu.Lock()
 				s.lastBusy = now
