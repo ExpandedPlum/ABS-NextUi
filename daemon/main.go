@@ -141,6 +141,8 @@ func serve() {
 		SDCard:  env("SDCARD_PATH", "/mnt/SDCARD"),
 		FFmpeg:  env("ABSD_FFMPEG", defaultFFmpeg()),
 		Output:  env("ABSD_AUDIO_OUT", "alsa"),
+		// NextUI sets HOME to the userdata dir; ALSA reads $HOME/.asoundrc.
+		UserData: env("ABSD_USERDATA", env("USERDATA_PATH", os.Getenv("HOME"))),
 	}
 	log.Printf("absd %s starting (data=%s ffmpeg=%s out=%s)", service.Version, opts.DataDir, opts.FFmpeg, opts.Output)
 	if err := player.Probe(context.Background(), opts.FFmpeg); err != nil {

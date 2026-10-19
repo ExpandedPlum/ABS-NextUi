@@ -184,6 +184,7 @@ func (s *Service) routes() http.Handler {
 	h("/sleep", func(ctx context.Context, r req) (any, error) { s.SetSleep(r.Minutes); return nil, nil })
 	h("/finished", func(ctx context.Context, r req) (any, error) { return nil, s.MarkFinished(r.ID, r.Episode, r.Finished) })
 	h("/sync", func(ctx context.Context, r req) (any, error) { s.Sync(false); s.flushPending(); return nil, nil })
+	h("/gameaudio/toggle", func(ctx context.Context, r req) (any, error) { s.Hotkey("gameAudio"); return s.gameAudioStatus(), nil })
 	h("/presleep", func(ctx context.Context, r req) (any, error) { s.PreSleep(); return nil, nil })
 
 	h("/download", func(ctx context.Context, r req) (any, error) { return nil, s.QueueDownload(ctx, r.ID, r.Episode) })

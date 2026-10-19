@@ -59,6 +59,8 @@ type Config struct {
 	// Output is "alsa" (default) or "null" for testing without a sound card.
 	Output string
 	Device string
+	// DeviceFunc, when set, picks the ALSA device each time playback starts.
+	DeviceFunc func() string
 	// SampleRate of the stream handed to ALSA.
 	SampleRate int
 }
@@ -313,7 +315,11 @@ func (e *Engine) args(t Track, local float64) []string {
 	if e.cfg.Output == "null" {
 		a = append(a, "-f", "null", "-")
 	} else {
-		a = append(a, "-f", "alsa", e.cfg.Device)
+		dev := e.cfg.Device
+		if e.cfg.DeviceFunc != nil {
+			dev = e.cfg.DeviceFunc()
+		}
+		a = append(a, "-f", "alsa", dev)
 	}
 	return a
 }

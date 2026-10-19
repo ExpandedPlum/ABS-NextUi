@@ -53,6 +53,10 @@ play a game**. Podcasts work too.
 - **Background playback**: exit the app with *Keep listening* and the book
   keeps playing in the NextUI menu and inside games.
 - **In-game controls**: play/pause and skip without leaving your game.
+- **Game sound while listening**: games are muted (or turned down) only
+  while a book is playing; pause the book and game sound comes back. FN2
+  toggles game sound on/off while you listen. The audiobook's volume isn't
+  affected.
 - Progress is saved automatically before the device sleeps or shuts down.
 
 ## Install
@@ -111,6 +115,7 @@ menu):
 | FN1, or SELECT+START | Play / pause |
 | SELECT+L1 | Skip back |
 | SELECT+R1 | Skip forward |
+| FN2 | Game sound on/off while listening |
 
 The game also receives these presses; that can't be avoided without blocking
 input to the game. You can turn in-game controls off in Settings. You can
@@ -152,6 +157,13 @@ e.g. `"toggle": "FN2,SELECT+Y"`.
 - **Phone sign-in** serves a one-time page on port 8737 of the device's Wi-Fi
   address, under a random 12-character path. It accepts one successful sign-in
   and then closes; it also closes after 10 minutes or when you cancel.
+- **Game sound** works by chaining one more software volume control,
+  `ABS Game Volume`, in front of the device's default output. It is set in
+  `.userdata/tg5040/.asoundrc`, which ALSA reads because NextUI runs
+  programs with `HOME` set to that folder. Games use the default output,
+  while the book plays to `Playback` directly. NextUI's `audiomon` owns that
+  file while Bluetooth or USB-C audio is connected; the pak never touches
+  someone else's file, so game volume control is unavailable then.
 - A NextUI `pre-sleep.d` hook (`.userdata/tg5040/.hooks/pre-sleep.d/`)
   pauses and syncs before the device suspends.
 

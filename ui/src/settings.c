@@ -23,7 +23,8 @@ static const char *HOTKEY_HELP =
     "these buttons control playback:\n\n"
     "FN1 or SELECT+START  Play / pause\n"
     "SELECT+L1  Skip back\n"
-    "SELECT+R1  Skip forward\n\n"
+    "SELECT+R1  Skip forward\n"
+    "FN2  Game sound on/off while listening\n\n"
     "The game also sees these presses.\n"
     "Edit settings.json in .userdata/shared/Audiobookshelf\n"
     "to change the buttons.";
@@ -76,8 +77,19 @@ bool settings_screen(void) {
     ap_option about_opt[] = { { .label = "", .value = "" } };
     ap_option hotkey_help_opt[] = { { .label = "", .value = "" } };
 
-    ap_options_item items[10];
-    int n = 0, idx_lib = -1, idx_int = -1, idx_hk, idx_sleep, idx_account, idx_hkhelp, idx_about;
+    /* Game volume while a book plays, in dB (0 = leave games alone). */
+    static const int GAME_DB[] = { -99, -30, -20, -12, -6, 0 };
+    static const char *GAME_LABELS[] = { "Mute", "Very quiet", "Quiet", "Low", "Lower", "Normal" };
+    enum { N_GAME = 6 };
+    ap_option game_opts[N_GAME];
+    int game_sel = 0, cur_db = (int)jnum(set, "gameVolume");
+    for (int i = 0; i < N_GAME; i++) {
+        game_opts[i] = (ap_option){ .label = GAME_LABELS[i], .value = GAME_LABELS[i] };
+        if (GAME_DB[i] == cur_db) game_sel = i;
+    }
+
+    ap_options_item items[12];
+    int n = 0, idx_lib = -1, idx_int = -1, idx_hk, idx_game, idx_sleep, idx_account, idx_hkhelp, idx_about;
     if (nlibs > 1) {
         idx_lib = n;
         items[n++] = (ap_options_item){ .label = "Library", .type = AP_OPT_STANDARD, .options = lib_opts,
@@ -93,6 +105,9 @@ bool settings_screen(void) {
                                     .option_count = 2, .selected_option = jbool(hk, "enabled") ? 0 : 1 };
     idx_hkhelp = n;
     items[n++] = (ap_options_item){ .label = "In-game buttons", .type = AP_OPT_CLICKABLE, .options = hotkey_help_opt, .option_count = 1 };
+    idx_game = n;
+    items[n++] = (ap_options_item){ .label = "Game sound while listening", .type = AP_OPT_STANDARD, .options = game_opts,
+                                    .option_count = N_GAME, .selected_option = game_sel };
     idx_sleep = n;
     items[n++] = (ap_options_item){ .label = "Pause when device sleeps", .type = AP_OPT_STANDARD, .options = onoff,
                                     .option_count = 2, .selected_option = jbool(set, "pauseOnSleep") ? 0 : 1 };
@@ -148,6 +163,7 @@ bool settings_screen(void) {
         cJSON_AddBoolToObject(hko, "enabled", items[idx_hk].selected_option == 0);
         cJSON_AddItemToObject(s, "hotkeys", hko);
         cJSON_AddBoolToObject(s, "pauseOnSleep", items[idx_sleep].selected_option == 0);
+        cJSON_AddNumberToObject(s, "gameVolume", GAME_DB[items[idx_game].selected_option]);
         char *str = cJSON_PrintUnformatted(b);
         absd_cmd("/settings", str);
         free(str);

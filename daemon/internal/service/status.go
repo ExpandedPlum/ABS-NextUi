@@ -32,18 +32,19 @@ type PlayerStatus struct {
 }
 
 type Status struct {
-	Version   string         `json:"version"`
-	LoggedIn  bool           `json:"loggedIn"`
-	Server    string         `json:"server,omitempty"`
-	Username  string         `json:"username,omitempty"`
-	Online    bool           `json:"online"`
-	LibraryID string         `json:"libraryId,omitempty"`
-	Phone     *PhoneLogin    `json:"phoneLogin,omitempty"`
-	Player    PlayerStatus   `json:"player"`
-	Downloads []any          `json:"downloads"`
-	Settings  store.Settings `json:"settings"`
-	Pending   int            `json:"pendingSyncs"`
-	Time      int64          `json:"time"`
+	Version   string          `json:"version"`
+	LoggedIn  bool            `json:"loggedIn"`
+	Server    string          `json:"server,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	Online    bool            `json:"online"`
+	LibraryID string          `json:"libraryId,omitempty"`
+	Phone     *PhoneLogin     `json:"phoneLogin,omitempty"`
+	GameAudio GameAudioStatus `json:"gameAudio"`
+	Player    PlayerStatus    `json:"player"`
+	Downloads []any           `json:"downloads"`
+	Settings  store.Settings  `json:"settings"`
+	Pending   int             `json:"pendingSyncs"`
+	Time      int64           `json:"time"`
 }
 
 func (s *Service) Status() Status {
@@ -79,6 +80,7 @@ func (s *Service) Status() Status {
 	}
 	st.Player = ps
 	st.Phone = s.phoneStatus()
+	st.GameAudio = s.gameAudioStatus()
 	return st
 }
 

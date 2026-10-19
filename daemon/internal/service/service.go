@@ -19,6 +19,7 @@ import (
 
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/abs"
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/downloads"
+	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/gameaudio"
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/player"
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/store"
 )
@@ -68,16 +69,25 @@ type Service struct {
 	progCache   map[string]abs.MediaProgress
 	progCacheAt time.Time
 	phone       *phoneServer
+
+	game        *gameaudio.Router
+	gameMu      sync.Mutex
+	gameApplied int  // dB currently set on the game control
+	gameBusy    bool // an amixer/aplay call is in flight
+	gameLetIn   bool // user toggled game sound back on (FN2) while listening
+	gameErr     string
+	gameChecked time.Time
 }
 
 // OnSettings registers a callback run after settings change.
 func (s *Service) OnSettings(fn func(store.Settings)) { s.onSettings = fn }
 
 type Options struct {
-	DataDir string
-	SDCard  string
-	FFmpeg  string
-	Output  string
+	DataDir  string
+	UserData string // NextUI's per-platform userdata dir (where .asoundrc lives)
+	SDCard   string
+	FFmpeg   string
+	Output   string
 }
 
 func New(opts Options) (*Service, error) {
@@ -100,7 +110,14 @@ func New(opts Options) (*Service, error) {
 		}
 	})
 	s.Client.SetCredentials(st.Creds)
-	s.Eng = player.New(player.Config{FFmpeg: opts.FFmpeg, Output: opts.Output, Device: set.AudioDevice}, s.onPlayerEvent)
+	if opts.UserData != "" {
+		s.game = gameaudio.New(opts.UserData)
+		if conf := os.Getenv("ABSD_ASOUND_CONF"); conf != "" { // tests
+			s.game.SystemConf = conf
+		}
+	}
+	s.Eng = player.New(player.Config{FFmpeg: opts.FFmpeg, Output: opts.Output, Device: set.AudioDevice,
+		DeviceFunc: s.bookDevice}, s.onPlayerEvent)
 	s.Eng.SetSpeed(set.Speed)
 	s.DL = downloads.New(s.Client, st)
 	if err := os.MkdirAll(filepath.Join(st.CacheDir(), "covers"), 0o755); err != nil {
@@ -190,6 +207,7 @@ func (s *Service) Run() {
 				lastFlush = now
 				go s.flushPending()
 			}
+			s.reconcileGameAudio(snap.State, now)
 			if snap.State == player.StatePlaying || snap.State == player.StateLoading || s.DL.Busy() || s.uiActive() {
 				s.mu.Lock()
 				s.lastBusy = now
@@ -262,6 +280,10 @@ func (s *Service) Hotkey(action string) {
 		err = s.PrevChapter()
 	case "nextChapter":
 		err = s.NextChapter()
+	case "gameAudio":
+		s.gameMu.Lock()
+		s.gameLetIn = !s.gameLetIn
+		s.gameMu.Unlock()
 	}
 	if err != nil {
 		log.Printf("hotkey %s: %v", action, err)
@@ -822,6 +844,7 @@ func (s *Service) PreSleep() {
 // Shutdown is called on SIGTERM or quit: save everything.
 func (s *Service) Shutdown() {
 	s.Stop()
+	s.restoreGameAudio()
 }
 
 // ---------------------------------------------------------------------------
