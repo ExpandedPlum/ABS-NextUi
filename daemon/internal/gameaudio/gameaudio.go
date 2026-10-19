@@ -148,11 +148,21 @@ func (r *Router) Install() error {
 		r.created = false
 	}
 	if !r.created {
-		// softvol registers its control when the PCM is first opened.
-		if err := r.Run("aplay", "-q", "-D", pcmName, "-f", "S16_LE", "-r", "48000", "-c", "2", "-d", "1", "/dev/zero"); err != nil {
-			return fmt.Errorf("creating volume control: %w", err)
+		if err := r.createControl(); err != nil {
+			return err
 		}
 		r.created = true
+	}
+	return nil
+}
+
+// createControl opens the ABSGame PCM briefly: softvol registers its mixer
+// control on first open. The control can disappear (a service restart with
+// the file already present, or the codec being reset), so this is also done
+// whenever setting the volume fails.
+func (r *Router) createControl() error {
+	if err := r.Run("aplay", "-q", "-D", pcmName, "-f", "S16_LE", "-r", "48000", "-c", "2", "-d", "1", "/dev/zero"); err != nil {
+		return fmt.Errorf("creating volume control: %w", err)
 	}
 	return nil
 }
@@ -182,9 +192,23 @@ func Raw(db int) int {
 }
 
 // SetDB sets game volume: 0 = unchanged, negative = quieter, Mute = silent.
+// If the control is missing it is recreated and the set retried once.
 func (r *Router) SetDB(db int) error {
 	raw := Raw(db)
-	return r.Run("amixer", "-q", "-c", r.Card, "cset", "name="+controlFmt, fmt.Sprintf("%d,%d", raw, raw))
+	set := func() error {
+		return r.Run("amixer", "-q", "-c", r.Card, "cset", "name="+controlFmt, fmt.Sprintf("%d,%d", raw, raw))
+	}
+	if err := set(); err == nil {
+		return nil
+	}
+	r.mu.Lock()
+	err := r.createControl()
+	r.created = err == nil
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return set()
 }
 
 // BookDevice returns the ALSA device the book should use: "Playback" while

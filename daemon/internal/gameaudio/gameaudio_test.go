@@ -53,6 +53,27 @@ func TestInstallSetRemove(t *testing.T) {
 	}
 }
 
+// A missing control (service restarted with the file already present) is
+// recreated when setting the volume fails.
+func TestSetDBRecreatesControl(t *testing.T) {
+	r, calls := setup(t)
+	failOnce := true
+	r.Run = func(name string, args ...string) error {
+		*calls = append(*calls, name)
+		if name == "amixer" && failOnce {
+			failOnce = false
+			return os.ErrNotExist
+		}
+		return nil
+	}
+	if err := r.SetDB(Mute); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(*calls, ","); got != "amixer,aplay,amixer" {
+		t.Fatalf("calls %s", got)
+	}
+}
+
 func TestForeignFileUntouched(t *testing.T) {
 	r, _ := setup(t)
 	bt := "pcm.!default {\n type plug\n slave.pcm { type bluealsa } }\n"

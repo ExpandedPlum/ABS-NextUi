@@ -37,7 +37,7 @@ func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 	level := s.St.GetSettings().GameVolume
 	s.gameMu.Lock()
 	defer s.gameMu.Unlock()
-	if s.gameBusy {
+	if s.gameBusy || now.Before(s.gameRetry) {
 		return
 	}
 
@@ -100,7 +100,11 @@ func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 		s.gameMu.Lock()
 		s.gameBusy = false
 		if err != nil {
-			log.Printf("game audio: %v", err)
+			// Back off, and only log when the error changes.
+			s.gameRetry = time.Now().Add(5 * time.Second)
+			if s.gameErr != err.Error() {
+				log.Printf("game audio: %v", err)
+			}
 			s.gameErr = err.Error()
 		} else {
 			s.gameApplied = want

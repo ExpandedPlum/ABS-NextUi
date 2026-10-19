@@ -77,6 +77,7 @@ type Service struct {
 	gameLetIn   bool // user toggled game sound back on (FN2) while listening
 	gameErr     string
 	gameChecked time.Time
+	gameRetry   time.Time // don't retry a failed volume change before this
 }
 
 // OnSettings registers a callback run after settings change.
