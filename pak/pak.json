@@ -1,0 +1,17 @@
+{
+  "name": "Audiobookshelf",
+  "version": "v0.1.0",
+  "type": "TOOL",
+  "description": "Listen to audiobooks from your Audiobookshelf server, with the screen off or while you play games.",
+  "author": "ExpandedPlum",
+  "repo_url": "https://github.com/ExpandedPlum/ABS-NextUi",
+  "release_filename": "Audiobookshelf.pak.zip",
+  "changelog": {
+    "v0.1.0": "First release: streaming, downloads, chapters, speed, sleep timer, screen-off and in-game playback."
+  },
+  "screenshots": [],
+  "platforms": [
+    "tg5040"
+  ],
+  "launch": "launch.sh"
+}

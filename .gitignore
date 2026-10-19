@@ -1,0 +1,5 @@
+build/
+dist/
+ui/build/
+*.part
+*.tmp
