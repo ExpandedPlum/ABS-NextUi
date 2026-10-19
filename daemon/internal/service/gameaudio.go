@@ -9,19 +9,27 @@ import (
 
 // GameAudioStatus is reported to the UI.
 type GameAudioStatus struct {
-	Enabled   bool   `json:"enabled"`   // setting turns games down
-	Available bool   `json:"available"` // routing is installed
-	Ducking   bool   `json:"ducking"`   // games are turned down right now
-	LetIn     bool   `json:"letIn"`     // user toggled game sound back on
-	Error     string `json:"error,omitempty"`
+	Enabled bool   `json:"enabled"` // setting: mute games while a book plays
+	Muted   bool   `json:"muted"`   // games are silenced right now
+	Output  string `json:"output"`  // where NextUI sends audio
+	Error   string `json:"error,omitempty"`
 }
 
-// bookDevice is the ALSA device for the book: around the game control when
-// it is installed, otherwise the default (which follows Bluetooth audio). It
-// runs each time playback starts, so it also notes the routing in use.
+func (s *Service) muteGames() bool { return s.St.GetSettings().GameVolume < 0 }
+
+// bookDevice is the ALSA device for the book: the real output, around the
+// default device that games are silenced through. It runs each time
+// playback starts, so it silences games first (on USB or Bluetooth a running
+// game has to let go of the output before the book can open it) and notes
+// the output in use.
 func (s *Service) bookDevice() string {
 	if s.game != nil {
-		sig := s.game.Signature()
+		if s.muteGames() && s.setGameMute(true) {
+			if k := s.game.Sink().Kind; k == "usb" || k == "bluetooth" {
+				time.Sleep(300 * time.Millisecond)
+			}
+		}
+		sig := s.game.Sink().String()
 		s.sinkMu.Lock()
 		s.sinkSig = sig
 		s.sinkMu.Unlock()
@@ -35,92 +43,54 @@ func (s *Service) bookDevice() string {
 	return s.game.BookDevice()
 }
 
-// unknownLevel marks the game control's value as unknown (just installed, or
-// left from earlier), so the wanted level is always set.
-const unknownLevel = 1
+// setGameMute silences games or gives NextUI its audio file back, and
+// reports whether anything changed.
+func (s *Service) setGameMute(on bool) bool {
+	changed, err := s.game.SetMuted(on)
+	s.gameMu.Lock()
+	defer s.gameMu.Unlock()
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+		if msg != s.gameErr {
+			log.Printf("game audio: %v", err)
+		}
+	}
+	s.gameErr = msg
+	if err != nil || !changed {
+		return false
+	}
+	if on {
+		s.gameMutedAt = time.Now()
+		log.Printf("game audio: games muted (output: %s)", s.game.Sink())
+	} else {
+		log.Printf("game audio: game sound restored")
+	}
+	return true
+}
 
-// reconcileGameAudio runs every tick: keeps the routing in line with the
-// setting and the connected audio, and turns games down only while a book is
-// playing.
+// reconcileGameAudio runs every tick: games are muted exactly while a book
+// is playing (or held for an app switch).
 func (s *Service) reconcileGameAudio(state player.State, now time.Time) {
 	if s.game == nil {
 		return
 	}
-	level := s.St.GetSettings().GameVolume
-	enabled := level < 0
-	s.gameMu.Lock()
-	defer s.gameMu.Unlock()
-	if s.gameBusy || now.Before(s.gameRetry) {
-		return
-	}
-
-	// Check every second: NextUI deletes the file at boot, and audiomon
-	// rewrites or deletes it as USB/Bluetooth audio comes and goes.
-	if now.Sub(s.gameChecked) >= time.Second {
-		s.gameChecked = now
-		if s.game.Pending(enabled) {
-			s.gameBusy = true
-			go func() {
-				err := s.game.Install(enabled)
-				s.gameMu.Lock()
-				s.gameBusy = false
-				s.gameApplied = unknownLevel
-				if err != nil {
-					s.gameRetry = time.Now().Add(5 * time.Second)
-					if s.gameErr != err.Error() {
-						log.Printf("game audio: %v", err)
-					}
-					s.gameErr = err.Error()
-				} else {
-					s.gameErr = ""
-					if s.game.Installed() {
-						log.Printf("game audio: routing installed (book plays to %s)", s.game.BookDevice())
-					}
-				}
-				s.gameMu.Unlock()
-			}()
+	want := s.muteGames() && (state == player.StatePlaying || state == player.StateLoading)
+	if !want {
+		// Playback may have just started from another goroutine after this
+		// tick's snapshot was taken; don't undo its mute.
+		s.gameMu.Lock()
+		recent := now.Sub(s.gameMutedAt) < time.Second
+		s.gameMu.Unlock()
+		if recent {
 			return
 		}
 	}
-	if !s.game.Installed() {
-		s.gameErr = ""
-		if enabled {
-			if err := s.game.Unavailable(); err != nil {
-				s.gameErr = err.Error()
-			}
-		}
-		return
-	}
-
-	want := 0
-	if enabled && (state == player.StatePlaying || state == player.StateLoading) && !s.gameLetIn {
-		want = level
-	}
-	if want == s.gameApplied {
-		return
-	}
-	s.gameBusy = true
-	go func() {
-		err := s.game.SetDB(want)
-		s.gameMu.Lock()
-		s.gameBusy = false
-		if err != nil {
-			// Back off, and only log when the error changes.
-			s.gameRetry = time.Now().Add(5 * time.Second)
-			if s.gameErr != err.Error() {
-				log.Printf("game audio: %v", err)
-			}
-			s.gameErr = err.Error()
-		} else {
-			s.gameApplied = want
-			s.gameErr = ""
-		}
-		s.gameMu.Unlock()
-	}()
+	s.setGameMute(want)
 }
 
-// followSink reopens the book's output when the audio routing changes (USB
-// or Bluetooth audio plugged in or out), so the book moves to the new output
+// followSink reopens the book's output when NextUI's output changes (USB or
+// Bluetooth audio plugged in or out), so the book moves to the new output
 // instead of staying on the old one, or failing because it went away.
 func (s *Service) followSink(state player.State, now time.Time) {
 	if s.game == nil || now.Sub(s.sinkChecked) < time.Second {
@@ -130,20 +100,14 @@ func (s *Service) followSink(state player.State, now time.Time) {
 	if state != player.StatePlaying && state != player.StateError {
 		return
 	}
-	s.gameMu.Lock()
-	settling := s.gameBusy || s.game.Pending(s.St.GetSettings().GameVolume < 0)
-	s.gameMu.Unlock()
-	if settling {
-		return // our routing is about to change; follow it once it has
-	}
-	sig := s.game.Signature()
+	sig := s.game.Sink().String()
 	s.sinkMu.Lock()
-	changed := sig != s.sinkSig
+	changed := s.sinkSig != "" && sig != s.sinkSig // "" = no output opened yet
 	s.sinkMu.Unlock()
 	if !changed {
 		return
 	}
-	log.Printf("audio output changed; reopening")
+	log.Printf("audio output changed to %s; reopening", sig)
 	if state == player.StateError {
 		_ = s.Eng.Play()
 		return
@@ -151,12 +115,12 @@ func (s *Service) followSink(state player.State, now time.Time) {
 	_ = s.Eng.Seek(s.Eng.Position())
 }
 
-// restoreGameAudio puts games back to full volume (on exit).
+// restoreGameAudio gives games their sound back (on exit).
 func (s *Service) restoreGameAudio() {
-	if s.game == nil || !s.game.Installed() {
+	if s.game == nil {
 		return
 	}
-	if err := s.game.SetDB(0); err != nil {
+	if _, err := s.game.SetMuted(false); err != nil {
 		log.Printf("game audio: restore: %v", err)
 	}
 }
@@ -168,10 +132,9 @@ func (s *Service) gameAudioStatus() GameAudioStatus {
 	s.gameMu.Lock()
 	defer s.gameMu.Unlock()
 	return GameAudioStatus{
-		Enabled:   s.St.GetSettings().GameVolume < 0,
-		Available: s.game.Installed(),
-		Ducking:   s.gameApplied < 0,
-		LetIn:     s.gameLetIn,
-		Error:     s.gameErr,
+		Enabled: s.muteGames(),
+		Muted:   s.game.Muted(),
+		Output:  s.game.Sink().String(),
+		Error:   s.gameErr,
 	}
 }

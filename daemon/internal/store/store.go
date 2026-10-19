@@ -18,7 +18,6 @@ import (
 type Hotkeys struct {
 	Enabled     bool   `json:"enabled"`
 	Toggle      string `json:"toggle"`
-	GameAudio   string `json:"gameAudio"`
 	Back        string `json:"back"`
 	Forward     string `json:"forward"`
 	PrevChapter string `json:"prevChapter"`
@@ -27,7 +26,7 @@ type Hotkeys struct {
 
 func (h Hotkeys) Specs() map[string]string {
 	return map[string]string{
-		"toggle": h.Toggle, "gameAudio": h.GameAudio, "back": h.Back, "forward": h.Forward,
+		"toggle": h.Toggle, "back": h.Back, "forward": h.Forward,
 		"prevChapter": h.PrevChapter, "nextChapter": h.NextChapter,
 	}
 }
@@ -44,8 +43,8 @@ type Settings struct {
 	Hotkeys       Hotkeys `json:"hotkeys"`
 	AudioDevice   string  `json:"audioDevice"`
 	PauseOnSleep  bool    `json:"pauseOnSleep"`
-	// GameVolume is how loud games are while a book plays, in dB: 0 leaves
-	// them alone, -99 mutes them.
+	// GameVolume < 0 mutes games while a book plays; 0 leaves them alone.
+	// (Older versions had levels in between; any negative value mutes.)
 	GameVolume  int    `json:"gameVolume"`
 	LibrarySort string `json:"librarySort"`
 }
@@ -61,7 +60,6 @@ func DefaultSettings(sdcard string) Settings {
 		Hotkeys: Hotkeys{
 			Enabled:     true,
 			Toggle:      "FN1,SELECT+START",
-			GameAudio:   "FN2",
 			Back:        "SELECT+L1",
 			Forward:     "SELECT+R1",
 			PrevChapter: "",

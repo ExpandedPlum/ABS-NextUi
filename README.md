@@ -50,11 +50,10 @@ play a game**. Podcasts work too.
 - **Background playback**: exit the app with *Keep listening* and the book
   keeps playing in the NextUI menu and inside games.
 - **In-game controls**: play/pause and skip without leaving your game.
-- **Game sound while listening**: games are muted (or turned down) only
-  while a book is playing; pause the book and game sound comes back. FN2
-  toggles game sound on/off while you listen. The audiobook's volume isn't
-  affected. Works on the speaker, headphones and USB-C audio; not yet over
-  Bluetooth.
+- **Game sound while listening**: games are muted while a book is playing;
+  pause the book and game sound comes back. Works on the speaker,
+  headphones, USB-C audio and Bluetooth. Turn it off in Settings if you want
+  to hear both.
 - **USB-C and Bluetooth audio**: plugging in or unplugging moves the book to
   the new output while it plays.
 - **Quiet app switches**: the book pauses for about 3 seconds whenever a game
@@ -118,7 +117,6 @@ menu):
 | FN1, or SELECT+START | Play / pause |
 | SELECT+L1 | Skip back |
 | SELECT+R1 | Skip forward |
-| FN2 | Game sound on/off while listening |
 
 The game also receives these presses; that can't be avoided without blocking
 input to the game. You can turn in-game controls off in Settings. You can
@@ -160,21 +158,23 @@ e.g. `"toggle": "FN2,SELECT+Y"`.
 - **Phone sign-in** serves a one-time page on port 8737 of the device's Wi-Fi
   address, under a random 12-character path. It accepts one successful sign-in
   and then closes; it also closes after 10 minutes or when you cancel.
-- **Game sound** works by chaining one more software volume control,
-  `ABS Game Volume`, in front of the device's default output. It is set in
-  `.userdata/tg5040/.asoundrc`, which ALSA reads because NextUI runs
-  programs with `HOME` set to that folder. Games use the default output,
-  while the book plays to `Playback` directly.
-- **USB-C audio**: NextUI's `audiomon` writes that file when a USB DAC is
-  plugged in, opening the card as a raw `hw` device. Only one program can
-  use that at a time and it does no format conversion, so the book couldn't
-  play next to a game (or at all, on some DACs). The pak replaces the file
-  with one that mixes onto the DAC (`dmix`, with format conversion) and puts
-  the same game volume control in front. It still has a `type hw` line so
-  NextUI recognizes a USB DAC, and `audiomon` deletes it on unplug as before.
-- **Bluetooth audio**: the file is left alone. Emulators open the `bluealsa`
-  device directly rather than the default one, so game volume control isn't
-  available over Bluetooth.
+- **Muting games**: NextUI runs programs with `HOME` set to
+  `.userdata/tg5040`, so `.userdata/tg5040/.asoundrc` decides where the ALSA
+  default device (which games use) goes. While a book plays, the pak writes
+  one that sends it through a zero-gain `route` into the built-in codec:
+  silent, but paced by real hardware so games run at normal speed. The book
+  plays straight to the real output: `Playback` on the speaker or headphone
+  jack, `plughw:N,0` for a USB DAC, `bluealsa:DEV=…` for Bluetooth. So it
+  never shares a USB DAC or Bluetooth link with a game. When the book stops,
+  NextUI's own file is put back. Emulators watch that file and reopen their
+  audio when it changes.
+- NextUI's `audiomon` writes the same file for USB and Bluetooth audio and
+  deletes it on unplug. The pak's version keeps a copy of the file it
+  replaced (base64, in a comment), and if `audiomon` rewrites or deletes it
+  while a book plays, that becomes the new original. The pak's version never
+  looks like a Bluetooth file to NextUI, or emulators would open `bluealsa`
+  directly. If the output changes while the book plays, the book moves to
+  the new one.
 - A NextUI `pre-sleep.d` hook (`.userdata/tg5040/.hooks/pre-sleep.d/`)
   pauses and syncs before the device suspends.
 - `pre-launch.d` and `post-launch.d` hooks hold the book for 3 seconds
@@ -198,18 +198,16 @@ A quick check after changes that touch the device side:
 1. Play a book. Short-press POWER: the screen goes dark and audio continues.
    Volume buttons still work; POWER again restores brightness.
 2. Exit with *Keep listening* and start a game. You hear the book and no game
-   sound. FN2 toggles game sound; FN1 pauses/resumes the book (game sound
-   returns while paused).
-3. `adb shell amixer -c audiocodec cget name="'ABS Game Volume'"` shows
-   `values=0,0` while a book plays and `255,255` while it's paused.
-4. Start and quit a game, and open another pak, while a book plays: the book
+   sound. FN1 pauses/resumes the book; game sound returns while paused.
+3. Start and quit a game, and open another pak, while a book plays: the book
    pauses briefly each time and resumes with no loud blip.
-5. With a USB-C DAC plugged in, play a book and start a game: the book plays
-   and the game is muted. Unplug during playback: the book moves to the
-   speaker.
-6. Sleep the device during playback: it pauses, and the position reaches the
+4. Repeat 2 with a USB-C DAC, and with Bluetooth headphones. Plug in or
+   unplug during playback: the book moves to the new output.
+   `adb shell cat /mnt/SDCARD/.userdata/tg5040/.asoundrc` starts with
+   `# Managed by Audiobookshelf.pak` only while the book plays.
+5. Sleep the device during playback: it pauses, and the position reaches the
    server.
-7. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
+6. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
    up within a minute.
 
 Logs: `.userdata/tg5040/logs/Audiobookshelf-daemon.txt` (service) and

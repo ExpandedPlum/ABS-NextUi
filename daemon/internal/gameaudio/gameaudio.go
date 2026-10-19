@@ -1,35 +1,28 @@
-// Package gameaudio lets the daemon turn game (emulator) audio down while a
-// book plays.
+// Package gameaudio silences games (emulators) while a book plays.
 //
-// TrimUI's /etc/asound.conf routes the ALSA default device through
-// "Playback" (a softvol master in front of a dmix mixer). NextUI runs every
-// program with HOME=$USERDATA_PATH, so a $HOME/.asoundrc can put one more
-// softvol, "ABS Game Volume", in front of the default device that games use:
+// NextUI runs every program with HOME=$USERDATA_PATH, so $HOME/.asoundrc
+// decides where the ALSA default device, which games use, goes. While a book
+// plays, the daemon writes one that sends the default device through a
+// zero-gain route into the built-in codec ("Playback" in
+// /etc/asound.conf): silent, but still paced by real hardware so games run
+// at normal speed. The book plays straight to the real output (speaker,
+// headphones, USB DAC or Bluetooth), so it's the only thing heard and never
+// has to share a USB DAC or Bluetooth link with a game. When the book stops,
+// NextUI's own file is put back. Emulators watch the file and reopen their
+// audio whenever it changes.
 //
-//	game → ABSGame (ABS Game Volume) → Playback (master) → dmix → speaker
-//	book ───────────────────────────→ Playback (master) ↗
-//
-// The book plays to "Playback" directly so it isn't affected.
-//
-// NextUI's audiomon writes the same file while Bluetooth or USB audio is
-// connected. Its USB file opens the DAC as a raw "hw" device, which only one
-// program can use at a time and which does no format conversion, so the book
-// can't play next to a game. That file is replaced with one that mixes onto
-// the DAC instead, with the same game control in front:
-//
-//	game → ABSGame (ABS Game Volume) → ABSOut → ABSMix (dmix) → USB DAC
-//	book ───────────────────────────→ ABSOut ↗
-//
-// The replacement keeps a "type hw" line so NextUI still sees a USB DAC.
-// audiomon deletes the file on unplug. Bluetooth files are left alone:
-// emulators open the "bluealsa" device directly, not the default.
+// NextUI's audiomon writes the file for USB and Bluetooth audio and deletes
+// it on unplug. Ours carries a copy of the file it replaced so it can be
+// restored; if audiomon rewrites or deletes it while a book plays, that
+// becomes the new original.
 package gameaudio
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -37,325 +30,220 @@ import (
 )
 
 const (
-	marker     = "# Managed by Audiobookshelf.pak: game volume control."
-	controlFmt = "ABS Game Volume"
-	pcmName    = "ABSGame"
-	// BookDevice is where the book plays when the speaker routing is
-	// installed; USBBookDevice when the USB routing is.
-	BookDevice    = "Playback"
-	USBBookDevice = "ABSOut"
-	minDB         = -51.0
-	resolution    = 256
-	// Mute is the dB value meaning "silent".
-	Mute = -99
+	// Every file we write starts with this (older versions used other
+	// endings).
+	markerPrefix = "# Managed by Audiobookshelf.pak"
+	marker       = markerPrefix + ": games muted while a book plays."
+	origPrefix   = "# orig: "
 )
 
 var (
-	ErrForeign     = errors.New("not available with Bluetooth audio")
+	ErrUnknown     = errors.New("unrecognized audio setup")
 	ErrUnsupported = errors.New("this device's audio setup isn't supported")
+)
+
+// Sink is where NextUI is sending audio.
+type Sink struct {
+	Kind string // "speaker" (also the headphone jack), "usb", "bluetooth", "unknown"
+	ID   string // USB card or Bluetooth address
+}
+
+func (k Sink) String() string {
+	if k.ID == "" {
+		return k.Kind
+	}
+	return k.Kind + " " + k.ID
+}
+
+var (
+	// audiomon's files: pcm.!default { type hw card N } for USB, and
+	// defaults.bluealsa.device "MAC" for Bluetooth.
+	usbFile    = regexp.MustCompile(`pcm\.!default\s*\{\s*type\s+hw\s+card\s+([A-Za-z0-9_]+)\s*\}`)
+	btAddr     = regexp.MustCompile(`"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})"`)
+	legacyUSB  = regexp.MustCompile(`(?m)^# sink: usb ([A-Za-z0-9_]+)$`)
+	validCard  = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+	validBTDev = regexp.MustCompile(`^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`)
 )
 
 type Router struct {
 	Path       string // $USERDATA_PATH/.asoundrc
 	SystemConf string // /etc/asound.conf
-	Card       string
-	// Run executes a command with HOME pointing at Path's directory, so ALSA
-	// reads our .asoundrc. Replaceable in tests.
-	Run func(name string, args ...string) error
 
-	mu      sync.Mutex
-	created bool // the softvol control exists on the card
+	mu sync.Mutex
 }
 
 func New(userdata string) *Router {
-	r := &Router{
+	return &Router{
 		Path:       filepath.Join(userdata, ".asoundrc"),
 		SystemConf: "/etc/asound.conf",
-		Card:       "audiocodec",
 	}
-	r.Run = func(name string, args ...string) error {
-		cmd := exec.Command(name, args...)
-		cmd.Env = append(os.Environ(), "HOME="+filepath.Dir(r.Path))
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("%s: %v: %s", name, err, strings.TrimSpace(string(out)))
+}
+
+// Supported reports whether the system config has the built-in output that
+// games are silenced into.
+func (r *Router) Supported() bool {
+	b, err := os.ReadFile(r.SystemConf)
+	return err == nil && strings.Contains(string(b), "pcm.Playback")
+}
+
+// read returns the file's content, whether it is ours, and NextUI's original
+// (nil when there is none: the built-in speaker).
+func (r *Router) read() (cur []byte, ours bool, orig []byte) {
+	cur, err := os.ReadFile(r.Path)
+	if err != nil {
+		return nil, false, nil
+	}
+	if !bytes.HasPrefix(cur, []byte(markerPrefix)) {
+		if len(bytes.TrimSpace(cur)) == 0 {
+			return cur, false, nil
 		}
-		return nil
+		return cur, false, cur
 	}
-	return r
+	for _, line := range strings.Split(string(cur), "\n") {
+		if v, ok := strings.CutPrefix(line, origPrefix); ok {
+			o, _ := base64.StdEncoding.DecodeString(strings.TrimSpace(v))
+			if len(o) == 0 {
+				o = nil
+			}
+			return cur, true, o
+		}
+	}
+	// Older versions: speaker routing, or a shared USB DAC.
+	if m := legacyUSB.FindSubmatch(cur); m != nil {
+		return cur, true, []byte(audiomonUSB(string(m[1])))
+	}
+	return cur, true, nil
 }
 
-// Kinds of .asoundrc.
-const (
-	kindNone       = iota // no file: the built-in speaker
-	kindSpeaker           // ours, speaker routing
-	kindUSB               // ours, USB DAC routing
-	kindForeignUSB        // audiomon's USB DAC file
-	kindForeign           // anything else (Bluetooth)
-)
-
-// audiomon's USB file: pcm.!default { type hw card N }.
-var usbFile = regexp.MustCompile(`pcm\.!default\s*\{\s*type\s+hw\s+card\s+([A-Za-z0-9_]+)\s*\}`)
-var usbHeader = regexp.MustCompile(`(?m)^# sink: usb ([A-Za-z0-9_]+)$`)
-
-// gamePCM is the softvol in front of slave that games play through.
-func (r *Router) gamePCM(slave string) string {
-	return `pcm.` + pcmName + ` {
-    type plug
-    slave.pcm {
-        type softvol
-        slave.pcm "` + slave + `"
-        control {
-            name "` + controlFmt + `"
-            card ` + r.Card + `
-        }
-        min_dB ` + fmt.Sprintf("%.1f", minDB) + `
-        max_dB 0.0
-        resolution ` + fmt.Sprint(resolution) + `
-    }
-}
-`
+func audiomonUSB(card string) string {
+	return "pcm.!default {\n    type hw\n    card " + card + "\n}\nctl.!default {\n    type hw\n    card " + card + "\n}\n"
 }
 
-func (r *Router) speakerConfig() string {
-	return marker + `
-# sink: speaker
-# Games use the default device, which passes through "ABS Game Volume".
-# The audiobook plays to "Playback" directly. Deleted by NextUI at boot.
+func sinkOf(orig []byte) Sink {
+	if orig == nil {
+		return Sink{Kind: "speaker"}
+	}
+	s := string(orig)
+	if strings.Contains(s, "bluealsa") {
+		if m := btAddr.FindStringSubmatch(s); m != nil {
+			return Sink{Kind: "bluetooth", ID: m[1]}
+		}
+		return Sink{Kind: "unknown"}
+	}
+	if m := usbFile.FindStringSubmatch(s); m != nil {
+		return Sink{Kind: "usb", ID: m[1]}
+	}
+	return Sink{Kind: "unknown"}
+}
+
+// Sink returns where NextUI is sending audio, whether or not games are muted.
+func (r *Router) Sink() Sink {
+	_, _, orig := r.read()
+	return sinkOf(orig)
+}
+
+// Muted reports whether games are being silenced right now.
+func (r *Router) Muted() bool {
+	_, ours, _ := r.read()
+	return ours
+}
+
+// mutedConfig silences the default device and keeps NextUI's original.
+// It must not look like a Bluetooth file to NextUI (which scans for
+// "type bluealsa" and "defaults.bluealsa.device"), or emulators would open
+// the "bluealsa" device directly instead of the default one.
+func mutedConfig(orig []byte) string {
+	var b strings.Builder
+	b.WriteString(marker + "\n")
+	if orig != nil {
+		b.WriteString(origPrefix + base64.StdEncoding.EncodeToString(orig) + "\n")
+	}
+	b.WriteString(`# While an audiobook plays, games use a silent default device; the book
+# plays to the real output directly. NextUI's own file (encoded above) is
+# put back when the book stops.
 pcm.!default {
     type asym
-    playback.pcm "` + pcmName + `"
+    playback.pcm "ABSSilent"
     capture.pcm "Capture"
 }
 
-` + r.gamePCM("Playback")
-}
-
-func (r *Router) usbConfig(card string) string {
-	return marker + `
-# sink: usb ` + card + `
-# USB audio (card ` + card + `), shared so the audiobook can play next to games.
-# Games use the default device, which passes through "ABS Game Volume".
-# The audiobook plays to "` + USBBookDevice + `". NextUI deletes this on unplug.
-pcm.!default {
-    type asym
-    playback.pcm "` + pcmName + `"
-    capture.pcm "plughw:` + card + `,0"
-}
-
-ctl.!default {
-    type hw
-    card ` + card + `
-}
-
-pcm.` + USBBookDevice + ` {
+pcm.ABSSilent {
     type plug
-    slave.pcm "ABSMix"
-}
-
-pcm.ABSMix {
-    type dmix
-    ipc_key 2469
-    ipc_perm 0666
-    slave {
-        pcm {
-            type hw
-            card ` + card + `
-            device 0
-        }
-        rate 48000
-        channels 2
+    slave.pcm {
+        type route
+        slave.pcm "Playback"
+        slave.channels 2
+        ttable.0.0 0
+        ttable.1.1 0
     }
 }
-
-` + r.gamePCM(USBBookDevice)
+`)
+	// Keep the mixer device and the Bluetooth address NextUI's volume
+	// control relies on.
+	switch k := sinkOf(orig); k.Kind {
+	case "usb":
+		fmt.Fprintf(&b, "\nctl.!default {\n    type hw\n    card %s\n}\n", k.ID)
+	case "bluetooth":
+		fmt.Fprintf(&b, "\ndefaults {\n    bluealsa {\n        device %q\n    }\n}\n", k.ID)
+		b.WriteString("\nctl.!default {\n    type \"bluealsa\"\n}\n")
+	}
+	return b.String()
 }
 
-// Supported reports whether the system config has the layout we chain onto.
-func (r *Router) Supported() bool {
-	b, err := os.ReadFile(r.SystemConf)
-	if err != nil {
-		return false
-	}
-	s := string(b)
-	return strings.Contains(s, "pcm.Playback") && strings.Contains(s, "pcm.Capture") && strings.Contains(s, r.Card)
-}
-
-// state reads .asoundrc: its kind, and the USB card for the USB kinds.
-func (r *Router) state() (kind int, card string) {
-	b, err := os.ReadFile(r.Path)
-	if err != nil {
-		return kindNone, ""
-	}
-	s := string(b)
-	if strings.HasPrefix(s, marker) {
-		if m := usbHeader.FindStringSubmatch(s); m != nil {
-			return kindUSB, m[1]
-		}
-		return kindSpeaker, ""
-	}
-	if !strings.Contains(s, "bluealsa") {
-		if m := usbFile.FindStringSubmatch(s); m != nil {
-			return kindForeignUSB, m[1]
-		}
-	}
-	if strings.TrimSpace(s) == "" {
-		return kindNone, ""
-	}
-	return kindForeign, ""
-}
-
-// Installed reports whether games are currently routed through our control.
-func (r *Router) Installed() bool {
-	k, _ := r.state()
-	return k == kindSpeaker || k == kindUSB
-}
-
-// Signature identifies the current audio routing; it changes whenever the
-// book's output should be reopened.
-func (r *Router) Signature() string {
-	b, _ := os.ReadFile(r.Path)
-	return string(b)
-}
-
-// Unavailable says why games can't be routed through our control right now
-// (Bluetooth audio, or an unsupported device), or nil.
-func (r *Router) Unavailable() error {
-	switch k, _ := r.state(); k {
-	case kindForeign:
-		return ErrForeign
-	case kindNone:
-		if !r.Supported() {
-			return ErrUnsupported
-		}
-	}
-	return nil
-}
-
-// Pending reports whether Install(speaker) has anything to do.
-func (r *Router) Pending(speaker bool) bool {
-	k, _ := r.state()
+// SetMuted silences games (on) or gives NextUI back its own file (off). It
+// reports whether the file changed. Safe to call often: it only writes when
+// something differs, and picks up audiomon's changes while muted.
+func (r *Router) SetMuted(on bool) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	switch k {
-	case kindForeignUSB:
-		return true
-	case kindNone:
-		return speaker && r.Supported()
-	case kindSpeaker:
-		return !speaker || !r.created
-	case kindUSB:
-		return !r.created
+	cur, ours, orig := r.read()
+	if !on {
+		if !ours {
+			return false, nil
+		}
+		if orig == nil {
+			return true, os.Remove(r.Path)
+		}
+		return true, r.write(orig)
 	}
-	return false
+	if !r.Supported() {
+		return false, ErrUnsupported
+	}
+	if sinkOf(orig).Kind == "unknown" {
+		return false, ErrUnknown
+	}
+	want := mutedConfig(orig)
+	if string(cur) == want {
+		return false, nil
+	}
+	return true, r.write([]byte(want))
 }
 
-// Install brings .asoundrc in line: a USB DAC is always shared (so the book
-// can play at all), and the speaker routing is added when speaker is true and
-// removed when it is false. It makes sure the volume control exists so it can
-// be set before a game starts.
-func (r *Router) Install(speaker bool) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	k, card := r.state()
-	switch k {
-	case kindForeign:
-		return ErrForeign
-	case kindForeignUSB:
-		if err := r.write(r.usbConfig(card)); err != nil {
-			return err
-		}
-	case kindNone:
-		if !speaker {
-			return nil
-		}
-		if !r.Supported() {
-			return ErrUnsupported
-		}
-		if err := r.write(r.speakerConfig()); err != nil {
-			return err
-		}
-	case kindSpeaker:
-		if !speaker {
-			_ = os.Remove(r.Path)
-			return nil
-		}
-	}
-	if !r.created {
-		if err := r.createControl(); err != nil {
-			return err
-		}
-		r.created = true
-	}
-	return nil
-}
-
-func (r *Router) write(conf string) error {
+func (r *Router) write(b []byte) error {
 	tmp := r.Path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(conf), 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, r.Path); err != nil {
-		return err
-	}
-	r.created = false
-	return nil
+	return os.Rename(tmp, r.Path)
 }
 
-// createControl opens the ABSGame PCM briefly: softvol registers its mixer
-// control on first open. The control can disappear (a service restart with
-// the file already present, or the codec being reset), so this is also done
-// whenever setting the volume fails.
-func (r *Router) createControl() error {
-	if err := r.Run("aplay", "-q", "-D", pcmName, "-f", "S16_LE", "-r", "48000", "-c", "2", "-d", "1", "/dev/zero"); err != nil {
-		return fmt.Errorf("creating volume control: %w", err)
-	}
-	return nil
-}
-
-// Raw converts a dB level to the control's raw value.
-func Raw(db int) int {
-	if db <= Mute {
-		return 0
-	}
-	if db >= 0 {
-		return resolution - 1
-	}
-	v := int((float64(db)-minDB)/(-minDB)*float64(resolution-1) + 0.5)
-	if v < 1 {
-		v = 1
-	}
-	return v
-}
-
-// SetDB sets game volume: 0 = unchanged, negative = quieter, Mute = silent.
-// If the control is missing it is recreated and the set retried once.
-func (r *Router) SetDB(db int) error {
-	raw := Raw(db)
-	set := func() error {
-		return r.Run("amixer", "-q", "-c", r.Card, "cset", "name="+controlFmt, fmt.Sprintf("%d,%d", raw, raw))
-	}
-	if err := set(); err == nil {
-		return nil
-	}
-	r.mu.Lock()
-	err := r.createControl()
-	r.created = err == nil
-	r.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	return set()
-}
-
-// BookDevice returns the ALSA device the book should use: one that skips the
-// game control while our routing is installed, otherwise the default device
-// (which may be Bluetooth audio).
+// BookDevice returns the ALSA device for the book: the real output,
+// bypassing the default device that games are silenced through.
 func (r *Router) BookDevice() string {
-	switch k, _ := r.state(); k {
-	case kindSpeaker:
-		return BookDevice
-	case kindUSB:
-		return USBBookDevice
+	k := r.Sink()
+	switch k.Kind {
+	case "speaker":
+		if r.Supported() {
+			return "Playback"
+		}
+	case "usb":
+		if validCard.MatchString(k.ID) {
+			return "plughw:" + k.ID + ",0"
+		}
+	case "bluetooth":
+		if validBTDev.MatchString(k.ID) {
+			return "bluealsa:DEV=" + k.ID + ",PROFILE=a2dp"
+		}
 	}
 	return "default"
 }

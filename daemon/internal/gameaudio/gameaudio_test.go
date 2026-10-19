@@ -7,155 +7,167 @@ import (
 	"testing"
 )
 
-func setup(t *testing.T) (*Router, *[]string) {
+const (
+	btFile = "defaults.bluealsa.device \"AA:BB:CC:DD:EE:FF\"\n\npcm.!default {\n    type plug\n    slave.pcm {\n        type bluealsa\n" +
+		"        device \"AA:BB:CC:DD:EE:FF\"\n        profile \"a2dp\"\n        delay 0\n    }\n}\nctl.!default {\n    type bluealsa\n}\n"
+)
+
+func setup(t *testing.T) *Router {
 	dir := t.TempDir()
 	sys := filepath.Join(dir, "asound.conf")
 	_ = os.WriteFile(sys, []byte("pcm.!default {}\npcm.Playback {}\npcm.Capture { card audiocodec }\n"), 0o644)
 	r := New(dir)
 	r.SystemConf = sys
-	var calls []string
-	r.Run = func(name string, args ...string) error {
-		calls = append(calls, name+" "+strings.Join(args, " "))
-		return nil
-	}
-	return r, &calls
+	return r
 }
 
-func TestInstallSetRemove(t *testing.T) {
-	r, calls := setup(t)
-	if r.BookDevice() != "default" {
-		t.Fatal("book should use default before install")
-	}
-	if err := r.Install(true); err != nil {
+func read(t *testing.T, r *Router) string {
+	b, err := os.ReadFile(r.Path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := os.ReadFile(r.Path)
-	if !strings.HasPrefix(string(b), marker) || !strings.Contains(string(b), `slave.pcm "Playback"`) {
-		t.Fatalf("unexpected config:\n%s", b)
+	return string(b)
+}
+
+// What NextUI's detect_audio_device_type() would make of the file.
+func nextuiSees(conf string) string {
+	for _, line := range strings.Split(conf, "\n") {
+		if strings.Contains(line, "type bluealsa") || strings.Contains(line, "defaults.bluealsa.device") {
+			return "bluetooth"
+		}
+		if strings.Contains(line, "type hw") {
+			return "usb"
+		}
 	}
-	if r.BookDevice() != BookDevice {
-		t.Fatal("book should bypass the game control once installed")
+	return "default"
+}
+
+func TestSpeaker(t *testing.T) {
+	r := setup(t)
+	if r.Sink().Kind != "speaker" || r.BookDevice() != "Playback" || r.Muted() {
+		t.Fatal("unexpected initial state")
 	}
-	if len(*calls) != 1 || !strings.HasPrefix((*calls)[0], "aplay -q -D ABSGame") {
-		t.Fatalf("expected aplay to create the control, got %v", *calls)
+	if changed, err := r.SetMuted(true); err != nil || !changed {
+		t.Fatalf("mute: %v %v", changed, err)
 	}
-	if r.Pending(true) {
-		t.Fatal("nothing should be pending once installed")
+	conf := read(t, r)
+	if !strings.Contains(conf, `playback.pcm "ABSSilent"`) || strings.Contains(conf, origPrefix) {
+		t.Fatalf("unexpected config:\n%s", conf)
 	}
-	_ = r.Install(true) // idempotent: no second aplay
-	if len(*calls) != 1 {
-		t.Fatalf("control created twice: %v", *calls)
+	if !r.Muted() || r.Sink().Kind != "speaker" || r.BookDevice() != "Playback" {
+		t.Fatal("muted state wrong")
 	}
-	_ = r.SetDB(Mute)
-	if got := (*calls)[1]; got != "amixer -q -c audiocodec cset name=ABS Game Volume 0,0" {
-		t.Fatalf("mute command %q", got)
+	if changed, _ := r.SetMuted(true); changed {
+		t.Fatal("muting twice rewrote the file")
 	}
-	// Turning the feature off removes the speaker routing.
-	if !r.Pending(false) {
-		t.Fatal("removal should be pending")
+	if changed, _ := r.SetMuted(false); !changed {
+		t.Fatal("unmute did nothing")
 	}
-	_ = r.Install(false)
 	if _, err := os.Stat(r.Path); !os.IsNotExist(err) {
-		t.Fatal("our file was not removed")
-	}
-	if r.Pending(false) {
-		t.Fatal("nothing to do with the feature off and no file")
+		t.Fatal("speaker unmute should leave no file")
 	}
 }
 
-// audiomon's raw USB DAC file is replaced by a shared one, whether or not
-// games are being turned down, and NextUI still detects a USB DAC.
-func TestUSBTakeover(t *testing.T) {
-	for _, speaker := range []bool{true, false} {
-		r, calls := setup(t)
-		usb := "pcm.!default {\n    type hw\n    card 1\n}\nctl.!default {\n    type hw\n    card 1\n}\n"
-		_ = os.WriteFile(r.Path, []byte(usb), 0o644)
-		if r.BookDevice() != "default" || !r.Pending(speaker) {
-			t.Fatal("raw USB file should be pending takeover")
-		}
-		if err := r.Install(speaker); err != nil {
-			t.Fatal(err)
-		}
-		b, _ := os.ReadFile(r.Path)
-		conf := string(b)
-		for _, want := range []string{"# sink: usb 1", "type dmix", "card 1", "type hw", `slave.pcm "ABSOut"`, `playback.pcm "ABSGame"`} {
-			if !strings.Contains(conf, want) {
-				t.Fatalf("missing %q in:\n%s", want, conf)
-			}
-		}
-		if strings.Contains(conf, "bluealsa") {
-			t.Fatal("NextUI would mistake this for Bluetooth")
-		}
-		if r.BookDevice() != USBBookDevice || !r.Installed() || r.Pending(speaker) {
-			t.Fatalf("book device %q after takeover", r.BookDevice())
-		}
-		if len(*calls) != 1 {
-			t.Fatalf("expected one aplay, got %v", *calls)
-		}
-		// Unplugging: audiomon deletes the file; the speaker comes back.
-		_ = os.Remove(r.Path)
-		if r.Pending(speaker) != speaker {
-			t.Fatal("speaker routing should follow the setting after unplug")
-		}
+func TestUSBRestoresAudiomonFile(t *testing.T) {
+	r := setup(t)
+	usb := audiomonUSB("1")
+	_ = os.WriteFile(r.Path, []byte(usb), 0o644)
+	if k := r.Sink(); k.Kind != "usb" || k.ID != "1" || r.BookDevice() != "plughw:1,0" {
+		t.Fatalf("sink %v, book %s", k, r.BookDevice())
+	}
+	_, _ = r.SetMuted(true)
+	conf := read(t, r)
+	if r.BookDevice() != "plughw:1,0" || !strings.Contains(conf, "card 1") {
+		t.Fatalf("muted USB config:\n%s", conf)
+	}
+	if nextuiSees(conf) == "bluetooth" {
+		t.Fatal("emulators would bypass the silent device")
+	}
+	_, _ = r.SetMuted(false)
+	if read(t, r) != usb {
+		t.Fatal("audiomon's file not restored exactly")
 	}
 }
 
-// A missing control (service restarted with the file already present) is
-// recreated when setting the volume fails.
-func TestSetDBRecreatesControl(t *testing.T) {
-	r, calls := setup(t)
-	failOnce := true
-	r.Run = func(name string, args ...string) error {
-		*calls = append(*calls, name)
-		if name == "amixer" && failOnce {
-			failOnce = false
-			return os.ErrNotExist
-		}
-		return nil
+func TestBluetooth(t *testing.T) {
+	r := setup(t)
+	_ = os.WriteFile(r.Path, []byte(btFile), 0o644)
+	want := "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp"
+	if k := r.Sink(); k.Kind != "bluetooth" || r.BookDevice() != want {
+		t.Fatalf("sink %v, book %s", k, r.BookDevice())
 	}
-	if err := r.SetDB(Mute); err != nil {
-		t.Fatal(err)
+	_, _ = r.SetMuted(true)
+	conf := read(t, r)
+	if got := nextuiSees(conf); got != "default" {
+		t.Fatalf("NextUI sees %s; emulators would open bluealsa directly:\n%s", got, conf)
 	}
-	if got := strings.Join(*calls, ","); got != "amixer,aplay,amixer" {
-		t.Fatalf("calls %s", got)
+	if !strings.Contains(conf, `device "AA:BB:CC:DD:EE:FF"`) || r.BookDevice() != want {
+		t.Fatal("Bluetooth address lost while muted")
+	}
+	_, _ = r.SetMuted(false)
+	if read(t, r) != btFile {
+		t.Fatal("Bluetooth file not restored exactly")
 	}
 }
 
-func TestForeignFileUntouched(t *testing.T) {
-	r, _ := setup(t)
-	bt := "pcm.!default {\n type plug\n slave.pcm { type bluealsa } }\n"
-	_ = os.WriteFile(r.Path, []byte(bt), 0o644)
-	if r.Pending(true) {
-		t.Fatal("Bluetooth file must not be pending")
+// audiomon rewrites or deletes the file while a book plays: that becomes
+// the new original, and games stay muted.
+func TestAudiomonChangesWhileMuted(t *testing.T) {
+	r := setup(t)
+	_, _ = r.SetMuted(true)
+	_ = os.WriteFile(r.Path, []byte(btFile), 0o644) // Bluetooth connects
+	if r.Muted() || r.Sink().Kind != "bluetooth" {
+		t.Fatal("should see Bluetooth, unmuted")
 	}
-	if err := r.Install(true); err != ErrForeign {
-		t.Fatalf("want ErrForeign, got %v", err)
+	if changed, _ := r.SetMuted(true); !changed || r.Sink().Kind != "bluetooth" {
+		t.Fatal("should re-mute, keeping Bluetooth as the original")
 	}
-	if r.Unavailable() != ErrForeign {
-		t.Fatal("Bluetooth should be reported")
+	_ = os.Remove(r.Path) // disconnects
+	if r.Sink().Kind != "speaker" {
+		t.Fatal("should be back on the speaker")
 	}
-	_ = r.Install(false)
-	b, _ := os.ReadFile(r.Path)
-	if string(b) != bt {
-		t.Fatal("Bluetooth config was modified")
+	_, _ = r.SetMuted(true)
+	_, _ = r.SetMuted(false)
+	if _, err := os.Stat(r.Path); !os.IsNotExist(err) {
+		t.Fatal("speaker unmute should leave no file")
+	}
+}
+
+// Files from older versions count as ours.
+func TestLegacyFiles(t *testing.T) {
+	r := setup(t)
+	_ = os.WriteFile(r.Path, []byte(markerPrefix+": game volume control.\npcm.!default {}\n"), 0o644)
+	if !r.Muted() || r.Sink().Kind != "speaker" {
+		t.Fatal("old speaker routing not recognized")
+	}
+	_, _ = r.SetMuted(false)
+	if _, err := os.Stat(r.Path); !os.IsNotExist(err) {
+		t.Fatal("old file not removed")
+	}
+	_ = os.WriteFile(r.Path, []byte(markerPrefix+": game volume control.\n# sink: usb 2\n"), 0o644)
+	if k := r.Sink(); k.Kind != "usb" || k.ID != "2" {
+		t.Fatalf("old USB file: %v", k)
+	}
+	_, _ = r.SetMuted(false)
+	if read(t, r) != audiomonUSB("2") {
+		t.Fatal("old USB file not turned back into audiomon's")
+	}
+}
+
+func TestUnknownAndUnsupported(t *testing.T) {
+	r := setup(t)
+	other := "pcm.!default { type plug slave.pcm \"something\" }\n"
+	_ = os.WriteFile(r.Path, []byte(other), 0o644)
+	if _, err := r.SetMuted(true); err != ErrUnknown || read(t, r) != other {
+		t.Fatalf("unknown file must be left alone, got %v", err)
 	}
 	if r.BookDevice() != "default" {
-		t.Fatal("book must follow the default device (Bluetooth)")
+		t.Fatal("book should use the default device")
 	}
-}
 
-func TestUnsupported(t *testing.T) {
-	r, _ := setup(t)
+	r = setup(t)
 	_ = os.WriteFile(r.SystemConf, []byte("pcm.!default { type hw card 0 }\n"), 0o644)
-	if err := r.Install(true); err != ErrUnsupported {
+	if _, err := r.SetMuted(true); err != ErrUnsupported {
 		t.Fatalf("want ErrUnsupported, got %v", err)
-	}
-}
-
-func TestRaw(t *testing.T) {
-	for db, want := range map[int]int{0: 255, Mute: 0, -51: 1, -12: 195, -30: 105} {
-		if got := Raw(db); got != want {
-			t.Errorf("Raw(%d) = %d, want %d", db, got, want)
-		}
 	}
 }

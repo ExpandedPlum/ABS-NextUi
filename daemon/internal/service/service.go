@@ -72,12 +72,8 @@ type Service struct {
 
 	game        *gameaudio.Router
 	gameMu      sync.Mutex
-	gameApplied int  // dB currently set on the game control
-	gameBusy    bool // an amixer/aplay call is in flight
-	gameLetIn   bool // user toggled game sound back on (FN2) while listening
 	gameErr     string
-	gameChecked time.Time
-	gameRetry   time.Time // don't retry a failed volume change before this
+	gameMutedAt time.Time
 
 	sinkMu      sync.Mutex
 	sinkSig     string // audio routing when the book's output was opened
@@ -216,8 +212,8 @@ func (s *Service) Run() {
 			}
 			state := snap.State
 			if s.inTransition() {
-				// Keep games turned down while the book is held for an app
-				// switch, so the new game's first sounds don't leak through.
+				// Keep games muted while the book is held for an app switch,
+				// so the new game's first sounds don't leak through.
 				state = player.StatePlaying
 			}
 			s.reconcileGameAudio(state, now)
@@ -294,10 +290,6 @@ func (s *Service) Hotkey(action string) {
 		err = s.PrevChapter()
 	case "nextChapter":
 		err = s.NextChapter()
-	case "gameAudio":
-		s.gameMu.Lock()
-		s.gameLetIn = !s.gameLetIn
-		s.gameMu.Unlock()
 	}
 	if err != nil {
 		log.Printf("hotkey %s: %v", action, err)
