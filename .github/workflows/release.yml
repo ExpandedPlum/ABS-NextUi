@@ -95,7 +95,7 @@ jobs:
           cache-dependency-path: daemon/go.sum
 
       - name: Cache ffmpeg source
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/ffmpeg-work/*.tar.xz
           key: ffmpeg-src-7.1.2
