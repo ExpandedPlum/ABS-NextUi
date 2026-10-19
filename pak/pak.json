@@ -8,7 +8,8 @@
   "release_filename": "Audiobookshelf.pak.zip",
   "changelog": {
     "v0.1.0": "First release: streaming, downloads, chapters, speed, sleep timer, screen-off and in-game playback.",
-    "v0.2.0": "Podcasts, series, authors, collections, playlists, bookmarks, API-key and phone (QR) sign-in."
+    "v0.2.0": "Podcasts, series, authors, collections, playlists, bookmarks, API-key and phone (QR) sign-in.",
+    "v0.3.0": "Mute or lower game sound while a book plays (FN2 toggles), no volume blip when switching apps, startup diagnostics."
   },
   "screenshots": [],
   "platforms": [
