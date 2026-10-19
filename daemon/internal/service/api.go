@@ -41,6 +41,10 @@ func (s *Service) ServeControl(socketPath string) error {
 
 type req struct {
 	ID       string           `json:"id"`
+	Episode  string           `json:"episodeId"`
+	APIKey   string           `json:"apiKey"`
+	Title    string           `json:"title"`
+	Time     float64          `json:"time"`
 	Library  string           `json:"library"`
 	Query    string           `json:"q"`
 	Sort     string           `json:"sort"`
@@ -109,14 +113,17 @@ func (s *Service) routes() http.Handler {
 		return map[string]bool{"online": s.CheckOnline(ctx)}, nil
 	})
 	h("/login", func(ctx context.Context, r req) (any, error) {
-		err := s.Client.Login(ctx, r.Server, r.Username, r.Password)
+		var err error
+		if r.APIKey != "" {
+			err = s.Client.LoginAPIKey(ctx, r.Server, r.APIKey)
+		} else {
+			err = s.Client.Login(ctx, r.Server, r.Username, r.Password)
+		}
 		s.noteNetErr(err)
 		if err != nil {
 			return nil, err
 		}
-		set := s.St.GetSettings()
-		set.LibraryID = ""
-		_ = s.St.SaveSettings(set)
+		s.afterLogin()
 		return s.Status(), nil
 	})
 	h("/logout", func(ctx context.Context, r req) (any, error) {
@@ -134,15 +141,30 @@ func (s *Service) routes() http.Handler {
 		return map[string]any{"items": items, "cached": cached}, nil
 	})
 	h("/search", func(ctx context.Context, r req) (any, error) { return s.Search(ctx, r.Library, r.Query) })
+	h("/episodes/recent", func(ctx context.Context, r req) (any, error) { return s.RecentEpisodes(ctx, r.Library) })
+	h("/podcast", func(ctx context.Context, r req) (any, error) { return s.Podcast(ctx, r.ID) })
+	h("/series", func(ctx context.Context, r req) (any, error) { return s.SeriesList(ctx, r.Library) })
+	h("/series/items", func(ctx context.Context, r req) (any, error) { return s.SeriesItems(ctx, r.Library, r.ID) })
+	h("/authors", func(ctx context.Context, r req) (any, error) { return s.Authors(ctx, r.Library) })
+	h("/author/items", func(ctx context.Context, r req) (any, error) { return s.AuthorItems(ctx, r.ID) })
+	h("/collections", func(ctx context.Context, r req) (any, error) { return s.Collections(ctx, r.Library) })
+	h("/collection/items", func(ctx context.Context, r req) (any, error) { return s.CollectionItems(ctx, r.ID) })
+	h("/playlists", func(ctx context.Context, r req) (any, error) { return s.Playlists(ctx, r.Library) })
+	h("/playlist/items", func(ctx context.Context, r req) (any, error) { return s.PlaylistItems(ctx, r.ID) })
+	h("/bookmarks", func(ctx context.Context, r req) (any, error) { return s.Bookmarks(ctx, r.ID), nil })
+	h("/bookmark/add", func(ctx context.Context, r req) (any, error) { return s.AddBookmark(ctx, r.Title) })
+	h("/bookmark/delete", func(ctx context.Context, r req) (any, error) { return nil, s.DeleteBookmark(ctx, r.ID, r.Time) })
+	h("/login/phone", func(ctx context.Context, r req) (any, error) { return s.StartPhoneLogin() })
+	h("/login/phone/stop", func(ctx context.Context, r req) (any, error) { s.StopPhoneLogin(); return nil, nil })
 	h("/downloaded", func(ctx context.Context, r req) (any, error) {
-		return map[string]any{"items": nonNil(s.Downloaded()), "jobs": s.DL.Jobs()}, nil
+		return map[string]any{"items": s.Downloaded(), "jobs": s.DL.Jobs()}, nil
 	})
-	h("/item", func(ctx context.Context, r req) (any, error) { return s.Detail(ctx, r.ID) })
+	h("/item", func(ctx context.Context, r req) (any, error) { return s.Detail(ctx, r.ID, r.Episode) })
 	h("/cover", func(ctx context.Context, r req) (any, error) {
 		return map[string]string{"path": s.EnsureCover(ctx, r.ID)}, nil
 	})
 
-	h("/play", func(ctx context.Context, r req) (any, error) { return nil, s.Play(ctx, r.ID, r.Position) })
+	h("/play", func(ctx context.Context, r req) (any, error) { return nil, s.Play(ctx, r.ID, r.Episode, r.Position) })
 	h("/pause", func(ctx context.Context, r req) (any, error) { s.Pause(); return nil, nil })
 	h("/resume", func(ctx context.Context, r req) (any, error) { return nil, s.Resume() })
 	h("/toggle", func(ctx context.Context, r req) (any, error) { return nil, s.Toggle() })
@@ -160,13 +182,13 @@ func (s *Service) routes() http.Handler {
 	h("/chapters", func(ctx context.Context, r req) (any, error) { return s.Chapters(), nil })
 	h("/speed", func(ctx context.Context, r req) (any, error) { return nil, s.SetSpeed(r.Speed) })
 	h("/sleep", func(ctx context.Context, r req) (any, error) { s.SetSleep(r.Minutes); return nil, nil })
-	h("/finished", func(ctx context.Context, r req) (any, error) { return nil, s.MarkFinished(r.ID, r.Finished) })
+	h("/finished", func(ctx context.Context, r req) (any, error) { return nil, s.MarkFinished(r.ID, r.Episode, r.Finished) })
 	h("/sync", func(ctx context.Context, r req) (any, error) { s.Sync(false); s.flushPending(); return nil, nil })
 	h("/presleep", func(ctx context.Context, r req) (any, error) { s.PreSleep(); return nil, nil })
 
-	h("/download", func(ctx context.Context, r req) (any, error) { return nil, s.QueueDownload(ctx, r.ID) })
-	h("/download/cancel", func(ctx context.Context, r req) (any, error) { s.DL.Cancel(r.ID); return nil, nil })
-	h("/download/delete", func(ctx context.Context, r req) (any, error) { return nil, s.DeleteDownload(r.ID) })
+	h("/download", func(ctx context.Context, r req) (any, error) { return nil, s.QueueDownload(ctx, r.ID, r.Episode) })
+	h("/download/cancel", func(ctx context.Context, r req) (any, error) { s.DL.Cancel(r.ID, r.Episode); return nil, nil })
+	h("/download/delete", func(ctx context.Context, r req) (any, error) { return nil, s.DeleteDownload(r.ID, r.Episode) })
 
 	h("/settings", func(ctx context.Context, r req) (any, error) {
 		if r.Settings != nil {
@@ -193,13 +215,6 @@ func (s *Service) routes() http.Handler {
 		return nil, nil
 	})
 	return mux
-}
-
-func nonNil[T any](v []T) []T {
-	if v == nil {
-		return []T{}
-	}
-	return v
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

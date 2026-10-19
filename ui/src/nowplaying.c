@@ -12,7 +12,7 @@ static const char *NP_HELP =
     "X  Chapters\n"
     "Y  Sleep timer\n"
     "SELECT  Playback speed\n"
-    "START  Stop playback\n"
+    "START  More: bookmarks, sleep, speed, stop\n"
     "B  Back (keeps playing)\n"
     "POWER  Screen off / on (keeps playing)\n"
     "Hold POWER  Save and shut down";
@@ -158,12 +158,66 @@ static void render(cJSON *st, cover_cache *cover, ap_footer_item *footer, int fo
     ap_present();
 }
 
+/* START menu. Returns true if playback was stopped. */
+static bool more_menu(cJSON *st) {
+    cJSON *p = cJSON_GetObjectItem(st, "player");
+    char item_id[128];
+    snprintf(item_id, sizeof(item_id), "%s", jstr(p, "itemId"));
+    bool book = jstr(p, "episodeId")[0] == '\0';
+    enum { M_ADD_BM, M_BOOKMARKS, M_SLEEP, M_SPEED, M_STOP };
+    ap_list_item items[5];
+    int acts[5], n = 0;
+    if (book) {
+        items[n] = (ap_list_item){ .label = "Add bookmark here" }; acts[n++] = M_ADD_BM;
+        items[n] = (ap_list_item){ .label = "Bookmarks..." }; acts[n++] = M_BOOKMARKS;
+    }
+    items[n] = (ap_list_item){ .label = "Sleep timer...", .trailing_text = "Y" }; acts[n++] = M_SLEEP;
+    items[n] = (ap_list_item){ .label = "Playback speed...", .trailing_text = "SELECT" }; acts[n++] = M_SPEED;
+    items[n] = (ap_list_item){ .label = "Stop playback" }; acts[n++] = M_STOP;
+    ap_footer_item footer[] = {
+        { .button = AP_BTN_B, .label = "BACK" },
+        { .button = AP_BTN_A, .label = "SELECT", .is_confirm = true },
+    };
+    ap_list_opts o = ap_list_default_opts("More", items, n);
+    o.footer = footer;
+    o.footer_count = 2;
+    o.status_bar = &g_status_bar;
+    ap_list_result r;
+    if (ap_list(&o, &r) != AP_OK || r.selected_index < 0) return false;
+    switch (acts[r.selected_index]) {
+        case M_ADD_BM: {
+            char err[256], msg[300], tm[32];
+            cJSON *b = absd_call("/bookmark/add", "{}", err, sizeof(err));
+            if (!b) {
+                show_message(err);
+                break;
+            }
+            fmt_clock(jnum(b, "time"), tm, sizeof(tm));
+            snprintf(msg, sizeof(msg), "Bookmarked at %s%s", tm,
+                     jbool(b, "pending") ? "\n\nSaved on the device; it uploads\nwhen the server is reachable." : "");
+            cJSON_Delete(b);
+            show_message(msg);
+            break;
+        }
+        case M_BOOKMARKS: bookmarks_screen(item_id, true); break;
+        case M_SLEEP: sleep_picker(); break;
+        case M_SPEED: speed_picker(); break;
+        case M_STOP:
+            if (confirm("Stop playback?\nYour position is saved.", "STOP")) {
+                absd_cmd("/stop", NULL);
+                return true;
+            }
+            break;
+    }
+    return false;
+}
+
 void now_playing_screen(void) {
     cover_cache cover = {0};
     ap_footer_item footer[] = {
         { .button = AP_BTN_B,      .label = "BACK" },
         { .button = AP_BTN_X,      .label = "CHAPTERS" },
-        { .button = AP_BTN_Y,      .label = "SLEEP" },
+        { .button = AP_BTN_START,  .label = "MORE" },
         { .button = AP_BTN_A,      .label = "PAUSE", .is_confirm = true },
     };
     int footer_count = (int)(sizeof(footer) / sizeof(footer[0]));
@@ -194,10 +248,7 @@ void now_playing_screen(void) {
                 case AP_BTN_Y: sleep_picker(); acted = true; break;
                 case AP_BTN_SELECT: speed_picker(); acted = true; break;
                 case AP_BTN_START:
-                    if (confirm("Stop playback?\nYour position is saved.", "STOP")) {
-                        absd_cmd("/stop", NULL);
-                        running = false;
-                    }
+                    if (more_menu(st)) running = false;
                     acted = true;
                     break;
                 case AP_BTN_MENU: ap_show_help_overlay(NP_HELP); break;

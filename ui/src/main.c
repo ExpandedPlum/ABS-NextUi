@@ -42,26 +42,67 @@ static bool wait_for_daemon(void) {
     return ap_process_message(&o, wait_worker, NULL) == AP_OK;
 }
 
-/* Pick a library the first time (or if the saved one disappeared). */
-static void ensure_library(cJSON *st) {
-    if (jstr(st, "libraryId")[0]) return;
+static cJSON *g_libraries; /* cached /libraries response */
+
+static cJSON *libraries(bool refresh) {
+    if (g_libraries && !refresh) return g_libraries;
     char err[256];
-    cJSON *libs = call_with_spinner("Loading libraries...", "/libraries", NULL, err, sizeof(err));
-    if (!libs) return;
-    cJSON *first = cJSON_GetArrayItem(libs, 0);
-    if (first) {
-        cJSON *b = cJSON_CreateObject();
-        cJSON *s = cJSON_AddObjectToObject(b, "settings");
-        cJSON_AddStringToObject(s, "libraryId", jstr(first, "id"));
-        char *str = cJSON_PrintUnformatted(b);
-        absd_cmd("/settings", str);
-        free(str);
-        cJSON_Delete(b);
+    cJSON *libs = g_libraries ? absd_call("/libraries", NULL, err, sizeof(err))
+                              : call_with_spinner("Loading libraries...", "/libraries", NULL, err, sizeof(err));
+    if (libs) {
+        cJSON_Delete(g_libraries);
+        g_libraries = libs;
     }
-    cJSON_Delete(libs);
+    return g_libraries;
 }
 
-enum { H_NOW, H_CONTINUE, H_LIBRARY, H_RECENT, H_SEARCH, H_DOWNLOADS, H_SETTINGS };
+static void save_library(const char *id) {
+    char *b = jbody("libraryId", id, NULL);
+    char body[300];
+    snprintf(body, sizeof(body), "{\"settings\":%s}", b);
+    free(b);
+    absd_cmd("/settings", body);
+}
+
+/* The library the home screen shows; picks the first one if none is saved
+ * (or the saved one disappeared). */
+static cJSON *current_library(cJSON *st) {
+    cJSON *libs = libraries(false);
+    cJSON *l;
+    cJSON_ArrayForEach(l, libs) {
+        if (strcmp(jstr(l, "id"), jstr(st, "libraryId")) == 0) return l;
+    }
+    l = cJSON_GetArrayItem(libs, 0);
+    if (l) save_library(jstr(l, "id"));
+    return l;
+}
+
+static void switch_library(void) {
+    cJSON *libs = libraries(true);
+    int n = cJSON_GetArraySize(libs);
+    if (n < 2) return;
+    ap_list_item *items = calloc((size_t)n, sizeof(*items));
+    for (int i = 0; i < n; i++) {
+        cJSON *l = cJSON_GetArrayItem(libs, i);
+        items[i] = (ap_list_item){ .label = jstr(l, "name"),
+                                   .trailing_text = strcmp(jstr(l, "mediaType"), "podcast") == 0 ? "Podcasts" : "Books" };
+    }
+    ap_footer_item footer[] = {
+        { .button = AP_BTN_B, .label = "BACK" },
+        { .button = AP_BTN_A, .label = "SWITCH", .is_confirm = true },
+    };
+    ap_list_opts o = ap_list_default_opts("Libraries", items, n);
+    o.footer = footer;
+    o.footer_count = 2;
+    o.status_bar = &g_status_bar;
+    ap_list_result r;
+    if (ap_list(&o, &r) == AP_OK && r.selected_index >= 0)
+        save_library(jstr(cJSON_GetArrayItem(libs, r.selected_index), "id"));
+    free(items);
+}
+
+enum { H_NOW, H_CONTINUE, H_LIBRARY, H_SERIES, H_AUTHORS, H_COLLECTIONS, H_PLAYLISTS, H_RECENT, H_EPISODES,
+       H_SEARCH, H_DOWNLOADS, H_SETTINGS };
 
 /* Returns when the user backs out of the app. */
 static void home_screen(void) {
@@ -74,10 +115,17 @@ static void home_screen(void) {
         }
         if (!jbool(st, "loggedIn")) {
             cJSON_Delete(st);
+            cJSON_Delete(g_libraries);
+            g_libraries = NULL;
             if (!login_screen()) return;
             continue;
         }
-        ensure_library(st);
+        cJSON *lib = current_library(st);
+        char lib_id[128], lib_name[128];
+        snprintf(lib_id, sizeof(lib_id), "%s", lib ? jstr(lib, "id") : "");
+        snprintf(lib_name, sizeof(lib_name), "%s", lib ? jstr(lib, "name") : APP_NAME);
+        bool podcasts = lib && strcmp(jstr(lib, "mediaType"), "podcast") == 0;
+        bool many_libs = cJSON_GetArraySize(g_libraries) > 1;
 
         cJSON *p = cJSON_GetObjectItem(st, "player");
         bool loaded = jstr(p, "itemId")[0] != '\0';
@@ -87,61 +135,87 @@ static void home_screen(void) {
         char now_trail[96], dl_trail[32];
         snprintf(now_trail, sizeof(now_trail), "%s", jstr(p, "title"));
         snprintf(dl_trail, sizeof(dl_trail), active_dl ? "%d active" : "", active_dl);
+        const char *offline = online ? NULL : "offline";
 
-        ap_list_item items[8];
-        int acts[8], n = 0;
-        if (loaded) {
-            items[n] = (ap_list_item){ .label = strcmp(jstr(p, "state"), "playing") == 0 ? "Now Playing" : "Paused",
-                                       .trailing_text = now_trail };
-            acts[n++] = H_NOW;
+        ap_list_item items[14];
+        int acts[14], n = 0;
+#define ROW(act, ...) do { items[n] = (ap_list_item){ __VA_ARGS__ }; acts[n++] = (act); } while (0)
+        if (loaded)
+            ROW(H_NOW, .label = strcmp(jstr(p, "state"), "playing") == 0 ? "Now Playing" : "Paused",
+                .trailing_text = now_trail);
+        ROW(H_CONTINUE, .label = "Continue Listening");
+        if (podcasts) {
+            ROW(H_LIBRARY, .label = "Podcasts", .trailing_text = offline);
+            ROW(H_EPISODES, .label = "Latest Episodes");
+            ROW(H_PLAYLISTS, .label = "Playlists");
+        } else {
+            ROW(H_LIBRARY, .label = "Library", .trailing_text = offline);
+            ROW(H_SERIES, .label = "Series");
+            ROW(H_AUTHORS, .label = "Authors");
+            ROW(H_COLLECTIONS, .label = "Collections");
+            ROW(H_PLAYLISTS, .label = "Playlists");
+            ROW(H_RECENT, .label = "Recently Added");
         }
-        items[n] = (ap_list_item){ .label = "Continue Listening" }; acts[n++] = H_CONTINUE;
-        items[n] = (ap_list_item){ .label = "Library", .trailing_text = online ? NULL : "offline" }; acts[n++] = H_LIBRARY;
-        items[n] = (ap_list_item){ .label = "Recently Added" }; acts[n++] = H_RECENT;
-        items[n] = (ap_list_item){ .label = "Search" }; acts[n++] = H_SEARCH;
-        items[n] = (ap_list_item){ .label = "Downloads", .trailing_text = dl_trail }; acts[n++] = H_DOWNLOADS;
-        items[n] = (ap_list_item){ .label = "Settings" }; acts[n++] = H_SETTINGS;
+        ROW(H_SEARCH, .label = "Search");
+        ROW(H_DOWNLOADS, .label = "Downloads", .trailing_text = dl_trail);
+        ROW(H_SETTINGS, .label = "Settings");
+#undef ROW
 
-        ap_footer_item footer[3];
+        ap_footer_item footer[4];
         int fc = 0;
         footer[fc++] = (ap_footer_item){ .button = AP_BTN_B, .label = "EXIT" };
+        if (many_libs) footer[fc++] = (ap_footer_item){ .button = AP_BTN_Y, .label = "LIBRARY" };
         if (loaded) footer[fc++] = (ap_footer_item){ .button = AP_BTN_X, .label = "PLAY/PAUSE" };
         footer[fc++] = (ap_footer_item){ .button = AP_BTN_A, .label = "OPEN", .is_confirm = true };
 
-        ap_list_opts o = ap_list_default_opts(APP_NAME, items, n);
+        ap_list_opts o = ap_list_default_opts(lib_name, items, n);
         o.footer = footer;
         o.footer_count = fc;
         o.status_bar = &g_status_bar;
         o.action_button = loaded ? AP_BTN_X : AP_BTN_NONE;
+        o.secondary_action_button = many_libs ? AP_BTN_Y : AP_BTN_NONE;
         o.initial_index = cursor < n ? cursor : 0;
         o.help_text = "POWER (short)  Screen off, audio keeps playing\n"
-                      "POWER (hold)   Save progress and shut down\n\n"
+                      "POWER (hold)   Save progress and shut down\n"
+                      "Y              Switch library\n\n"
                       "Exit with B and choose \"Keep listening\" to\n"
                       "play in the background, even during games.";
-        char library_body[256];
-        snprintf(library_body, sizeof(library_body), "{\"library\":\"%s\"}", jstr(st, "libraryId"));
-        char recent_body[300];
-        snprintf(recent_body, sizeof(recent_body), "{\"library\":\"%s\",\"sort\":\"added\"}", jstr(st, "libraryId"));
+        char *lib_body = jbody("library", lib_id, NULL);
+        char *recent_body = jbody("library", lib_id, "sort", "added", NULL);
         cJSON_Delete(st);
 
         ap_list_result r;
-        if (ap_list(&o, &r) != AP_OK) return;
-        cursor = r.selected_index;
-        if (r.action == AP_ACTION_TRIGGERED) {
-            absd_cmd("/toggle", NULL);
-            continue;
+        int ret = ap_list(&o, &r);
+        if (ret == AP_OK) {
+            cursor = r.selected_index;
+            if (r.action == AP_ACTION_TRIGGERED) {
+                absd_cmd("/toggle", NULL);
+            } else if (r.action == AP_ACTION_SECONDARY_TRIGGERED) {
+                switch_library();
+                cursor = 0;
+            } else {
+                switch (acts[r.selected_index]) {
+                    case H_NOW: now_playing_screen(); break;
+                    case H_CONTINUE: entry_list_screen("Continue Listening", "/continue", "{}", 0); break;
+                    case H_LIBRARY: entry_list_screen(lib_name, "/library", lib_body, LIST_SORTABLE); break;
+                    case H_SERIES: entry_list_screen("Series", "/series", lib_body, 0); break;
+                    case H_AUTHORS: entry_list_screen("Authors", "/authors", lib_body, 0); break;
+                    case H_COLLECTIONS: entry_list_screen("Collections", "/collections", lib_body, 0); break;
+                    case H_PLAYLISTS: entry_list_screen("Playlists", "/playlists", lib_body, 0); break;
+                    case H_RECENT: entry_list_screen("Recently Added", "/library", recent_body, 0); break;
+                    case H_EPISODES: entry_list_screen("Latest Episodes", "/episodes/recent", lib_body, 0); break;
+                    case H_SEARCH: search_screen(lib_id); break;
+                    case H_DOWNLOADS: downloads_screen(); break;
+                    case H_SETTINGS:
+                        if (settings_screen()) cursor = 0;
+                        libraries(true);
+                        break;
+                }
+            }
         }
-        switch (acts[r.selected_index]) {
-            case H_NOW: now_playing_screen(); break;
-            case H_CONTINUE: book_list_screen("Continue Listening", "/continue", "{}", false); break;
-            case H_LIBRARY: book_list_screen("Library", "/library", library_body, true); break;
-            case H_RECENT: book_list_screen("Recently Added", "/library", recent_body, false); break;
-            case H_SEARCH: search_screen(); break;
-            case H_DOWNLOADS: downloads_screen(); break;
-            case H_SETTINGS:
-                if (settings_screen()) cursor = 0;
-                break;
-        }
+        free(lib_body);
+        free(recent_body);
+        if (ret != AP_OK) return;
     }
 }
 
@@ -159,7 +233,7 @@ static void exit_choice(void) {
         return;
     }
     ap_list_item items[] = {
-        { .label = playing ? "Keep listening" : "Keep paused (resume in-game with FN1)" },
+        { .label = playing ? "Keep listening" : "Keep paused (FN1 resumes in games)" },
         { .label = "Stop playback and exit" },
     };
     ap_footer_item footer[] = {

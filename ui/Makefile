@@ -1,7 +1,7 @@
 # Builds the UI. `make` builds for the desktop (testing); `make device` is run
 # inside the tg5040 toolchain container by the top-level Makefile.
 
-SRC := src/main.c src/ipc.c src/power.c src/util.c src/screens.c src/nowplaying.c third_party/cjson/cJSON.c
+SRC := src/main.c src/ipc.c src/power.c src/util.c src/screens.c src/settings.c src/nowplaying.c third_party/cjson/cJSON.c
 HDR := $(wildcard src/*.h) third_party/apostrophe/apostrophe.h third_party/apostrophe/apostrophe_widgets.h
 INC := -Isrc -Ithird_party/apostrophe -Ithird_party/cjson
 WARN := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare

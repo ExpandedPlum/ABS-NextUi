@@ -1,15 +1,33 @@
-/* Browsing screens: login, book lists, details, downloads, settings. */
+/* Browsing screens: login, lists, details, downloads, search. */
 #include "common.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Builds a JSON object from key/value string pairs, NULL-terminated. Empty
+ * values are left out. Caller frees. */
+char *jbody(const char *key, ...) {
+    cJSON *o = cJSON_CreateObject();
+    va_list ap;
+    va_start(ap, key);
+    for (const char *k = key; k; k = va_arg(ap, const char *)) {
+        const char *v = va_arg(ap, const char *);
+        if (v && v[0]) cJSON_AddStringToObject(o, k, v);
+    }
+    va_end(ap);
+    char *s = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    return s;
+}
+
 /* ── Playback entry point ────────────────────────────────────────────────── */
 
-void play_item(const char *item_id, double position, bool use_position) {
+void play_item(const char *item_id, const char *episode_id, double position, bool use_position) {
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "id", item_id);
+    if (episode_id && episode_id[0]) cJSON_AddStringToObject(body, "episodeId", episode_id);
     if (use_position) cJSON_AddNumberToObject(body, "position", position);
     char *s = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
@@ -26,6 +44,117 @@ void play_item(const char *item_id, double position, bool use_position) {
 
 /* ── Login ───────────────────────────────────────────────────────────────── */
 
+/* Shows a QR code for the daemon's one-time login page and waits until the
+ * phone has signed in. */
+static bool phone_login(void) {
+    char err[256];
+    cJSON *p = call_with_spinner("Preparing...", "/login/phone", "{}", err, sizeof(err));
+    if (!p) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "Phone sign-in isn't available:\n%s", err);
+        show_message(msg);
+        return false;
+    }
+    char url[256];
+    snprintf(url, sizeof(url), "%s", jstr(p, "url"));
+    SDL_Texture *qr = ap_load_image(jstr(p, "qr"));
+    cJSON_Delete(p);
+
+    ap_theme *t = ap_get_theme();
+    ap_footer_item footer[] = { { .button = AP_BTN_B, .label = "CANCEL" } };
+    bool logged_in = false, running = true;
+    Uint32 last_poll = 0;
+    char message[128] = "";
+    while (running) {
+        ap_input_event ev;
+        while (ap_poll_input(&ev)) {
+            if (ev.pressed && ev.button == AP_BTN_B) running = false;
+        }
+        if (!running) break;
+        if (SDL_GetTicks() - last_poll > 1000) {
+            last_poll = SDL_GetTicks();
+            cJSON *st = absd_status();
+            if (st) {
+                logged_in = jbool(st, "loggedIn");
+                cJSON *ph = cJSON_GetObjectItem(st, "phoneLogin");
+                snprintf(message, sizeof(message), "%s", ph ? jstr(ph, "message") : "");
+                if (!ph && !logged_in) running = false; /* timed out */
+                cJSON_Delete(st);
+            }
+            if (logged_in) break;
+        }
+        if (screen_is_off()) {
+            SDL_WaitEventTimeout(NULL, 500);
+            continue;
+        }
+        ap_clear_screen();
+        ap_draw_screen_title("Sign in from your phone", &g_status_bar);
+        ap_draw_status_bar(&g_status_bar);
+        SDL_Rect cr = ap_get_content_rect(true, true, true);
+        int pad = UI_DS(8);
+        int qs = cr.h - pad * 2;
+        if (qs > cr.w / 2) qs = cr.w / 2;
+        int qx = cr.x + pad, qy = cr.y + (cr.h - qs) / 2;
+        ap_draw_rect(qx, qy, qs, qs, (ap_color){ 255, 255, 255, 255 });
+        if (qr) ap_draw_image(qr, qx, qy, qs, qs);
+        int x = qx + qs + pad * 3, w = cr.x + cr.w - x - pad;
+        TTF_Font *sm = ap_get_font(AP_FONT_SMALL), *ti = ap_get_font(AP_FONT_TINY);
+        int y = qy;
+        y += ap_draw_text_wrapped(sm, "Scan the code with your phone (same Wi-Fi), or open:", x, y, w, t->text, AP_ALIGN_LEFT);
+        y += pad;
+        /* URLs have no spaces to wrap at; split after the host if needed. */
+        const char *shown = strncmp(url, "http://", 7) == 0 ? url + 7 : url;
+        const char *slash = strrchr(shown, '/');
+        if (ap_measure_text(sm, shown) <= w || !slash) {
+            ap_draw_text_ellipsized(sm, shown, x, y, t->text, w);
+            y += TTF_FontHeight(sm);
+        } else {
+            char host[128];
+            snprintf(host, sizeof(host), "%.*s", (int)(slash - shown + 1), shown);
+            ap_draw_text_ellipsized(sm, host, x, y, t->text, w);
+            y += TTF_FontHeight(sm);
+            ap_draw_text_ellipsized(sm, slash + 1, x, y, t->text, w);
+            y += TTF_FontHeight(sm);
+        }
+        y += pad * 2;
+        y += ap_draw_text_wrapped(ti, "Then enter your server and either your password or an API key.", x, y, w, t->hint, AP_ALIGN_LEFT);
+        if (message[0]) {
+            y += pad * 2;
+            ap_draw_text_wrapped(sm, message, x, y, w, t->text, AP_ALIGN_LEFT);
+        }
+        ap_draw_footer(footer, 1);
+        ap_present();
+        SDL_WaitEventTimeout(NULL, 250);
+    }
+    if (qr) SDL_DestroyTexture(qr);
+    absd_cmd("/login/phone/stop", NULL);
+    return logged_in;
+}
+
+static bool submit_login(const char *server, const char *user, const char *pass, const char *apikey) {
+    cJSON *b = cJSON_CreateObject();
+    cJSON_AddStringToObject(b, "server", server);
+    if (apikey) {
+        cJSON_AddStringToObject(b, "apiKey", apikey);
+    } else {
+        cJSON_AddStringToObject(b, "username", user);
+        cJSON_AddStringToObject(b, "password", pass);
+    }
+    char *s = cJSON_PrintUnformatted(b);
+    cJSON_Delete(b);
+    char err[256];
+    cJSON *res = call_with_spinner("Signing in...", "/login", s, err, sizeof(err));
+    free(s);
+    if (res) {
+        cJSON_Delete(res);
+        return true;
+    }
+    char msg[400];
+    snprintf(msg, sizeof(msg), "Sign-in failed:\n%s", err);
+    show_message(msg);
+    return false;
+}
+
 bool login_screen(void) {
     char server[1024] = "", user[1024] = "", pass[1024] = "";
     cJSON *st = absd_status();
@@ -34,7 +163,8 @@ bool login_screen(void) {
         snprintf(user, sizeof(user), "%s", jstr(st, "username"));
         cJSON_Delete(st);
     }
-    int cursor = server[0] ? (user[0] ? 2 : 1) : 0;
+    enum { R_PHONE, R_SERVER, R_USER, R_PASS, R_LOGIN, R_APIKEY };
+    int cursor = 0;
 
     for (;;) {
         char masked[64];
@@ -43,108 +173,133 @@ bool login_screen(void) {
         memset(masked, '*', pl);
         masked[pl] = '\0';
         ap_list_item items[] = {
+            { .label = "Sign in from your phone", .trailing_text = "QR code" },
             { .label = "Server", .trailing_text = server[0] ? server : "not set" },
             { .label = "Username", .trailing_text = user[0] ? user : "not set" },
             { .label = "Password", .trailing_text = pass[0] ? masked : "not set" },
-            { .label = "Log In" },
+            { .label = "Sign In" },
+            { .label = "Use an API key instead", .trailing_text = "SSO accounts" },
         };
         ap_footer_item footer[] = {
             { .button = AP_BTN_B, .label = "QUIT" },
-            { .button = AP_BTN_A, .label = "EDIT", .is_confirm = true },
+            { .button = AP_BTN_A, .label = "SELECT", .is_confirm = true },
         };
-        ap_list_opts o = ap_list_default_opts("Connect to Audiobookshelf", items, 4);
+        ap_list_opts o = ap_list_default_opts("Connect to Audiobookshelf", items, 6);
         o.footer = footer;
         o.footer_count = 2;
         o.status_bar = &g_status_bar;
         o.initial_index = cursor;
-        o.help_text = "Enter your Audiobookshelf server address, e.g.\n"
-                      "192.168.1.20:13378 or https://abs.example.com\n\n"
-                      "Then your username and password.";
+        o.help_text = "Easiest: \"Sign in from your phone\" shows a QR code.\n"
+                      "Open it on a phone on the same Wi-Fi and type\n"
+                      "your details there.\n\n"
+                      "Accounts that sign in with SSO/OpenID can use an\n"
+                      "API key (server Settings > API Keys).";
         ap_list_result r;
         if (ap_list(&o, &r) != AP_OK) return false;
         cursor = r.selected_index;
 
         ap_keyboard_result kb;
         switch (r.selected_index) {
-            case 0:
+            case R_PHONE:
+                if (phone_login()) return true;
+                break;
+            case R_SERVER:
                 if (ap_url_keyboard(server, NULL, NULL, &kb) == AP_OK) snprintf(server, sizeof(server), "%s", kb.text);
-                if (server[0]) cursor = 1;
+                if (server[0]) cursor = R_USER;
                 break;
-            case 1:
+            case R_USER:
                 if (ap_keyboard(user, NULL, AP_KB_GENERAL, &kb) == AP_OK) snprintf(user, sizeof(user), "%s", kb.text);
-                if (user[0]) cursor = 2;
+                if (user[0]) cursor = R_PASS;
                 break;
-            case 2:
+            case R_PASS:
                 if (ap_keyboard("", NULL, AP_KB_GENERAL, &kb) == AP_OK) snprintf(pass, sizeof(pass), "%s", kb.text);
-                cursor = 3;
+                cursor = R_LOGIN;
                 break;
-            case 3: {
+            case R_LOGIN:
                 if (!server[0] || !user[0]) {
                     show_message("Enter the server address and username first.");
                     break;
                 }
-                cJSON *b = cJSON_CreateObject();
-                cJSON_AddStringToObject(b, "server", server);
-                cJSON_AddStringToObject(b, "username", user);
-                cJSON_AddStringToObject(b, "password", pass);
-                char *s = cJSON_PrintUnformatted(b);
-                cJSON_Delete(b);
-                char err[256];
-                cJSON *res = call_with_spinner("Logging in...", "/login", s, err, sizeof(err));
-                free(s);
-                if (res) {
-                    cJSON_Delete(res);
-                    return true;
-                }
-                char msg[400];
-                snprintf(msg, sizeof(msg), "Login failed:\n%s", err);
-                show_message(msg);
+                if (submit_login(server, user, pass, NULL)) return true;
                 break;
-            }
+            case R_APIKEY:
+                if (!server[0]) {
+                    show_message("Enter the server address first.");
+                    cursor = R_SERVER;
+                    break;
+                }
+                if (ap_keyboard("", NULL, AP_KB_GENERAL, &kb) == AP_OK && kb.text[0] &&
+                    submit_login(server, NULL, NULL, kb.text))
+                    return true;
+                break;
         }
     }
 }
 
-/* ── Book lists ──────────────────────────────────────────────────────────── */
+/* ── Entry lists ─────────────────────────────────────────────────────────── */
 
-typedef struct {
-    ap_list_item *items;
-    char (*trail)[32];
-    int count;
-} book_rows;
+static bool is_playable(cJSON *e) {
+    const char *k = jstr(e, "kind");
+    return strcmp(k, "book") == 0 || strcmp(k, "episode") == 0;
+}
 
-static void build_rows(cJSON *arr, book_rows *rows) {
-    int n = cJSON_GetArraySize(arr);
-    rows->count = n;
-    rows->items = calloc((size_t)(n > 0 ? n : 1), sizeof(*rows->items));
-    rows->trail = calloc((size_t)(n > 0 ? n : 1), sizeof(*rows->trail));
-    for (int i = 0; i < n; i++) {
-        cJSON *b = cJSON_GetArrayItem(arr, i);
-        rows->items[i].label = jstr(b, "title");
-        rows->items[i].metadata = jstr(b, "id");
-        char *t = rows->trail[i];
-        double prog = jnum(b, "progress");
-        if (jbool(b, "finished")) snprintf(t, 32, "Done");
-        else if (prog > 0.005) snprintf(t, 32, "%d%%", (int)(prog * 100));
-        else t[0] = '\0';
-        if (jbool(b, "downloaded")) {
+static void entry_trailing(cJSON *e, bool mixed, char *t, size_t n) {
+    const char *k = jstr(e, "kind");
+    int c = (int)jnum(e, "count");
+    t[0] = '\0';
+    if (is_playable(e)) {
+        double prog = jnum(e, "progress");
+        if (jbool(e, "finished")) snprintf(t, n, "Done");
+        else if (prog > 0.005) snprintf(t, n, "%d%%", (int)(prog * 100));
+        if (jbool(e, "downloaded")) {
             size_t l = strlen(t);
-            snprintf(t + l, 32 - l, "%sSD", l ? "  " : "");
+            snprintf(t + l, n - l, "%sSD", l ? "  " : "");
         }
-        rows->items[i].trailing_text = t;
+    } else if (strcmp(k, "podcast") == 0) {
+        snprintf(t, n, "%d episode%s", c, c == 1 ? "" : "s");
+    } else if (strcmp(k, "playlist") == 0) {
+        snprintf(t, n, "%d item%s", c, c == 1 ? "" : "s");
+    } else if (mixed && strcmp(k, "author") == 0) {
+        snprintf(t, n, "Author");
+    } else if (mixed && strcmp(k, "series") == 0) {
+        snprintf(t, n, "Series");
+    } else {
+        snprintf(t, n, "%d book%s", c, c == 1 ? "" : "s");
     }
 }
 
-static void free_rows(book_rows *rows) {
-    free(rows->items);
-    free(rows->trail);
-    memset(rows, 0, sizeof(*rows));
+/* Opens an entry: playable ones show their details (or play when play is
+ * set); containers open their own list. */
+static void open_entry(cJSON *e, bool play) {
+    const char *k = jstr(e, "kind");
+    const char *id = jstr(e, "id");
+    char *b = NULL;
+    if (is_playable(e)) {
+        if (play) play_item(id, jstr(e, "episodeId"), 0, false);
+        else item_detail_screen(id, jstr(e, "episodeId"));
+        return;
+    }
+    if (strcmp(k, "podcast") == 0) {
+        b = jbody("id", id, NULL);
+        entry_list_screen(jstr(e, "title"), "/podcast", b, 0);
+    } else if (strcmp(k, "series") == 0) {
+        b = jbody("library", jstr(e, "library"), "id", id, NULL);
+        entry_list_screen(jstr(e, "title"), "/series/items", b, 0);
+    } else if (strcmp(k, "author") == 0) {
+        b = jbody("id", id, NULL);
+        entry_list_screen(jstr(e, "title"), "/author/items", b, 0);
+    } else if (strcmp(k, "collection") == 0) {
+        b = jbody("id", id, NULL);
+        entry_list_screen(jstr(e, "title"), "/collection/items", b, 0);
+    } else if (strcmp(k, "playlist") == 0) {
+        b = jbody("id", id, NULL);
+        entry_list_screen(jstr(e, "title"), "/playlist/items", b, 0);
+    }
+    free(b);
 }
 
 static const char *SORTS[] = { "title", "author", "added", "length" };
 static const char *SORT_LABELS[] = { "Title", "Author", "Recently added", "Length" };
-
-static cJSON *settings_from_status(cJSON *st) { return cJSON_GetObjectItem(st, "settings"); }
 
 static void save_setting_string(const char *key, const char *value) {
     cJSON *b = cJSON_CreateObject();
@@ -156,23 +311,27 @@ static void save_setting_string(const char *key, const char *value) {
     cJSON_Delete(b);
 }
 
-/* Shows books from a daemon endpoint. path/body describe the request; the
- * response is either an array or {"items": [...]} */
-void book_list_screen(const char *title, const char *path, const char *body, bool sortable) {
+/* Shows entries from a daemon endpoint. The response is either an array or
+ * an object with "items" (and optionally "cached"). */
+void entry_list_screen(const char *title, const char *path, const char *body, int flags) {
+    bool sortable = flags & LIST_SORTABLE, mixed = flags & LIST_MIXED;
     int sort = 0;
     char req_body[1024];
     snprintf(req_body, sizeof(req_body), "%s", body ? body : "{}");
     if (sortable) {
         cJSON *st = absd_status();
-        const char *cur = jstr(settings_from_status(st), "librarySort");
+        const char *cur = jstr(cJSON_GetObjectItem(st, "settings"), "librarySort");
         for (int i = 0; i < 4; i++) if (strcmp(cur, SORTS[i]) == 0) sort = i;
         cJSON_Delete(st);
     }
+    char title_copy[160];
+    snprintf(title_copy, sizeof(title_copy), "%s", title);
 
     bool reload = true;
-    cJSON *resp = NULL;
-    book_rows rows = {0};
-    int cursor = 0, top = 0;
+    cJSON *resp = NULL, *arr = NULL;
+    ap_list_item *items = NULL;
+    char (*trail)[40] = NULL;
+    int count = 0, cursor = 0, top = 0;
     bool cached = false;
 
     for (;;) {
@@ -194,43 +353,50 @@ void book_list_screen(const char *title, const char *path, const char *body, boo
                 break;
             }
             cJSON_Delete(resp);
-            free_rows(&rows);
+            free(items);
+            free(trail);
             resp = nr;
-            cJSON *arr = cJSON_IsArray(resp) ? resp : cJSON_GetObjectItem(resp, "items");
+            arr = cJSON_IsArray(resp) ? resp : cJSON_GetObjectItem(resp, "items");
             cached = jbool(resp, "cached");
-            build_rows(arr, &rows);
+            count = cJSON_GetArraySize(arr);
+            items = calloc((size_t)(count > 0 ? count : 1), sizeof(*items));
+            trail = calloc((size_t)(count > 0 ? count : 1), sizeof(*trail));
+            for (int i = 0; i < count; i++) {
+                cJSON *e = cJSON_GetArrayItem(arr, i);
+                items[i].label = jstr(e, "title");
+                entry_trailing(e, mixed, trail[i], sizeof(trail[i]));
+                items[i].trailing_text = trail[i];
+            }
             reload = false;
         }
-        if (rows.count == 0) {
+        if (count == 0) {
             show_message("Nothing here yet.");
             break;
         }
 
-        char full_title[160];
-        if (sortable)
-            snprintf(full_title, sizeof(full_title), "%s%s", title, cached ? " (offline)" : "");
-        else
-            snprintf(full_title, sizeof(full_title), "%s", title);
+        char full_title[200];
+        snprintf(full_title, sizeof(full_title), "%s%s", title_copy, cached ? " (offline)" : "");
         char sort_label[48];
         snprintf(sort_label, sizeof(sort_label), "SORT: %s", SORT_LABELS[sort]);
         ap_footer_item footer[4];
         int fc = 0;
         footer[fc++] = (ap_footer_item){ .button = AP_BTN_B, .label = "BACK" };
         if (sortable) footer[fc++] = (ap_footer_item){ .button = AP_BTN_Y, .label = sort_label };
-        footer[fc++] = (ap_footer_item){ .button = AP_BTN_X, .label = "PLAY" };
+        bool any_playable = false;
+        for (int i = 0; i < count && !any_playable; i++) any_playable = is_playable(cJSON_GetArrayItem(arr, i));
+        if (any_playable) footer[fc++] = (ap_footer_item){ .button = AP_BTN_X, .label = "PLAY" };
         footer[fc++] = (ap_footer_item){ .button = AP_BTN_A, .label = "OPEN", .is_confirm = true };
 
-        ap_list_opts o = ap_list_default_opts(full_title, rows.items, rows.count);
+        ap_list_opts o = ap_list_default_opts(full_title, items, count);
         o.footer = footer;
         o.footer_count = fc;
         o.status_bar = &g_status_bar;
-        o.action_button = AP_BTN_X;
+        o.action_button = any_playable ? AP_BTN_X : AP_BTN_NONE;
         if (sortable) o.secondary_action_button = AP_BTN_Y;
         o.initial_index = cursor;
         o.visible_start_index = top;
         ap_list_result r;
-        int ret = ap_list(&o, &r);
-        if (ret != AP_OK) break;
+        if (ap_list(&o, &r) != AP_OK) break;
         cursor = r.selected_index >= 0 ? r.selected_index : cursor;
         top = r.visible_start_index;
 
@@ -242,35 +408,126 @@ void book_list_screen(const char *title, const char *path, const char *body, boo
             continue;
         }
         if (r.selected_index < 0) continue;
-        const char *id = rows.items[r.selected_index].metadata;
-        char idbuf[128];
-        snprintf(idbuf, sizeof(idbuf), "%s", id);
-        if (r.action == AP_ACTION_TRIGGERED) {
-            play_item(idbuf, 0, false);
-        } else {
-            book_detail_screen(idbuf);
-        }
+        open_entry(cJSON_GetArrayItem(arr, r.selected_index), r.action == AP_ACTION_TRIGGERED);
     }
-    free_rows(&rows);
+    free(items);
+    free(trail);
     cJSON_Delete(resp);
 }
 
-/* ── Book detail ─────────────────────────────────────────────────────────── */
+/* ── Bookmarks ───────────────────────────────────────────────────────────── */
 
-static void book_actions(cJSON *d) {
-    const char *id = jstr(d, "id");
+void bookmarks_screen(const char *item_id, bool in_player) {
+    char body[200];
+    snprintf(body, sizeof(body), "{\"id\":\"%s\"}", item_id);
+    int cursor = 0;
+    for (;;) {
+        char err[256];
+        cJSON *bms = absd_call("/bookmarks", body, err, sizeof(err));
+        if (!bms) {
+            show_message(err);
+            return;
+        }
+        int n = cJSON_GetArraySize(bms);
+        if (n == 0) {
+            cJSON_Delete(bms);
+            show_message("No bookmarks yet.\n\nWhile listening, press START (MORE)\nand choose \"Add bookmark\".");
+            return;
+        }
+        ap_list_item *items = calloc((size_t)n, sizeof(*items));
+        char (*tt)[32] = calloc((size_t)n, sizeof(*tt));
+        for (int i = 0; i < n; i++) {
+            cJSON *b = cJSON_GetArrayItem(bms, i);
+            fmt_clock(jnum(b, "time"), tt[i], sizeof(tt[i]));
+            if (jbool(b, "pending")) strncat(tt[i], " *", sizeof(tt[i]) - strlen(tt[i]) - 1);
+            items[i].label = jstr(b, "title");
+            items[i].trailing_text = tt[i];
+        }
+        ap_footer_item footer[] = {
+            { .button = AP_BTN_B, .label = "BACK" },
+            { .button = AP_BTN_X, .label = "DELETE" },
+            { .button = AP_BTN_A, .label = "PLAY HERE", .is_confirm = true },
+        };
+        ap_list_opts o = ap_list_default_opts("Bookmarks", items, n);
+        o.footer = footer;
+        o.footer_count = 3;
+        o.status_bar = &g_status_bar;
+        o.action_button = AP_BTN_X;
+        o.initial_index = cursor < n ? cursor : 0;
+        o.help_text = "A plays from the bookmark. X deletes it.\n* = made offline, uploads when back online.";
+        ap_list_result r;
+        int ret = ap_list(&o, &r);
+        double t = r.selected_index >= 0 ? jnum(cJSON_GetArrayItem(bms, r.selected_index), "time") : 0;
+        cursor = r.selected_index;
+        free(items);
+        free(tt);
+        cJSON_Delete(bms);
+        if (ret != AP_OK || r.selected_index < 0) return;
+        if (r.action == AP_ACTION_TRIGGERED) {
+            if (confirm("Delete this bookmark?", "DELETE")) {
+                char db[256];
+                snprintf(db, sizeof(db), "{\"id\":\"%s\",\"time\":%.3f}", item_id, t);
+                if (!absd_cmd("/bookmark/delete", db)) show_message("Couldn't delete the bookmark. Try again when online.");
+            }
+            continue;
+        }
+        if (in_player) {
+            char sb[64];
+            snprintf(sb, sizeof(sb), "{\"position\":%.3f}", t);
+            absd_cmd("/seek", sb);
+        } else {
+            play_item(item_id, NULL, t, true);
+        }
+        return;
+    }
+}
+
+/* ── Book / episode detail ───────────────────────────────────────────────── */
+
+static void chapter_play_picker(cJSON *d) {
+    cJSON *chs = cJSON_GetObjectItem(d, "chapters");
+    int cn = cJSON_GetArraySize(chs);
+    if (cn == 0) return;
+    ap_list_item *ci = calloc((size_t)cn, sizeof(*ci));
+    char (*tt)[24] = calloc((size_t)cn, sizeof(*tt));
+    for (int i = 0; i < cn; i++) {
+        cJSON *c = cJSON_GetArrayItem(chs, i);
+        ci[i].label = jstr(c, "title");
+        fmt_clock(jnum(c, "start"), tt[i], sizeof(tt[i]));
+        ci[i].trailing_text = tt[i];
+    }
+    ap_footer_item footer[] = {
+        { .button = AP_BTN_B, .label = "BACK" },
+        { .button = AP_BTN_A, .label = "PLAY", .is_confirm = true },
+    };
+    ap_list_opts co = ap_list_default_opts("Play from chapter", ci, cn);
+    co.footer = footer;
+    co.footer_count = 2;
+    co.status_bar = &g_status_bar;
+    ap_list_result cr;
+    int sel = (ap_list(&co, &cr) == AP_OK) ? cr.selected_index : -1;
+    double start = sel >= 0 ? jnum(cJSON_GetArrayItem(chs, sel), "start") : 0;
+    free(ci);
+    free(tt);
+    if (sel >= 0) play_item(jstr(d, "id"), jstr(d, "episodeId"), start, true);
+}
+
+static void item_actions(cJSON *d) {
+    const char *id = jstr(d, "id"), *ep = jstr(d, "episodeId");
+    bool episode = ep[0] != '\0';
     cJSON *dl = cJSON_GetObjectItem(d, "download");
     bool downloaded = jbool(d, "downloaded");
     bool downloading = dl && strcmp(jstr(dl, "state"), "error") != 0;
     bool finished = jbool(d, "finished");
 
-    enum { A_START, A_CHAPTER, A_DOWNLOAD, A_CANCEL_DL, A_DELETE_DL, A_FINISHED, A_UNFINISHED };
-    ap_list_item items[6];
-    int acts[6], n = 0;
+    enum { A_START, A_CHAPTER, A_BOOKMARKS, A_DOWNLOAD, A_CANCEL_DL, A_DELETE_DL, A_FINISHED, A_UNFINISHED };
+    ap_list_item items[8];
+    int acts[8], n = 0;
     items[n] = (ap_list_item){ .label = "Play from beginning" }; acts[n++] = A_START;
     if (cJSON_GetArraySize(cJSON_GetObjectItem(d, "chapters")) > 0) {
         items[n] = (ap_list_item){ .label = "Play from chapter..." }; acts[n++] = A_CHAPTER;
     }
+    if (!episode) { items[n] = (ap_list_item){ .label = "Bookmarks..." }; acts[n++] = A_BOOKMARKS; }
     if (downloaded) { items[n] = (ap_list_item){ .label = "Remove download" }; acts[n++] = A_DELETE_DL; }
     else if (downloading) { items[n] = (ap_list_item){ .label = "Cancel download" }; acts[n++] = A_CANCEL_DL; }
     else { items[n] = (ap_list_item){ .label = "Download to SD card" }; acts[n++] = A_DOWNLOAD; }
@@ -288,39 +545,12 @@ static void book_actions(cJSON *d) {
     ap_list_result r;
     if (ap_list(&o, &r) != AP_OK || r.selected_index < 0) return;
 
-    char body[256], err[256];
-    snprintf(body, sizeof(body), "{\"id\":\"%s\"}", id);
+    char *body = jbody("id", id, "episodeId", ep, NULL);
+    char err[256];
     switch (acts[r.selected_index]) {
-        case A_START:
-            play_item(id, 0, true);
-            break;
-        case A_CHAPTER: {
-            cJSON *chs = cJSON_GetObjectItem(d, "chapters");
-            int cn = cJSON_GetArraySize(chs);
-            ap_list_item *ci = calloc((size_t)cn, sizeof(*ci));
-            char (*tt)[24] = calloc((size_t)cn, sizeof(*tt));
-            for (int i = 0; i < cn; i++) {
-                cJSON *c = cJSON_GetArrayItem(chs, i);
-                ci[i].label = jstr(c, "title");
-                fmt_clock(jnum(c, "start"), tt[i], sizeof(tt[i]));
-                ci[i].trailing_text = tt[i];
-            }
-            ap_list_opts co = ap_list_default_opts("Play from chapter", ci, cn);
-            co.footer = footer;
-            co.footer_count = 2;
-            co.status_bar = &g_status_bar;
-            ap_list_result cr;
-            if (ap_list(&co, &cr) == AP_OK && cr.selected_index >= 0) {
-                double start = jnum(cJSON_GetArrayItem(chs, cr.selected_index), "start");
-                free(ci);
-                free(tt);
-                play_item(id, start, true);
-                return;
-            }
-            free(ci);
-            free(tt);
-            break;
-        }
+        case A_START: play_item(id, ep, 0, true); break;
+        case A_CHAPTER: chapter_play_picker(d); break;
+        case A_BOOKMARKS: bookmarks_screen(id, false); break;
         case A_DOWNLOAD: {
             cJSON *res = call_with_spinner("Queueing download...", "/download", body, err, sizeof(err));
             if (res) {
@@ -331,34 +561,40 @@ static void book_actions(cJSON *d) {
             }
             break;
         }
-        case A_CANCEL_DL:
-            absd_cmd("/download/cancel", body);
-            break;
+        case A_CANCEL_DL: absd_cmd("/download/cancel", body); break;
         case A_DELETE_DL:
-            if (confirm("Remove this book from the SD card?", "REMOVE")) {
+            if (confirm("Remove this from the SD card?", "REMOVE")) {
                 cJSON *res = absd_call("/download/delete", body, err, sizeof(err));
                 if (res) cJSON_Delete(res);
                 else show_message(err);
             }
             break;
         case A_FINISHED:
-        case A_UNFINISHED:
-            snprintf(body, sizeof(body), "{\"id\":\"%s\",\"finished\":%s}", id,
-                     acts[r.selected_index] == A_FINISHED ? "true" : "false");
-            if (!absd_cmd("/finished", body)) show_message("Couldn't update the server. Try again when online.");
+        case A_UNFINISHED: {
+            cJSON *b = cJSON_Parse(body);
+            cJSON_AddBoolToObject(b, "finished", acts[r.selected_index] == A_FINISHED);
+            char *s = cJSON_PrintUnformatted(b);
+            if (!absd_cmd("/finished", s)) show_message("Couldn't update the server. Try again when online.");
+            free(s);
+            cJSON_Delete(b);
             break;
+        }
     }
+    free(body);
 }
 
-void book_detail_screen(const char *item_id) {
-    char body[256];
-    snprintf(body, sizeof(body), "{\"id\":\"%s\"}", item_id);
+void item_detail_screen(const char *item_id, const char *episode_id) {
+    char id[128], ep[128];
+    snprintf(id, sizeof(id), "%s", item_id);
+    snprintf(ep, sizeof(ep), "%s", episode_id ? episode_id : "");
+    char *body = jbody("id", id, "episodeId", ep, NULL);
+    bool episode = ep[0] != '\0';
     for (;;) {
         char err[256];
         cJSON *d = call_with_spinner("Loading...", "/item", body, err, sizeof(err));
         if (!d) {
             show_message(err);
-            return;
+            break;
         }
 
         char length[32], progress[96], chapters[16], dlstate[48];
@@ -380,15 +616,20 @@ void book_detail_screen(const char *item_id) {
         else if (dl) snprintf(dlstate, sizeof(dlstate), "Downloading %d%%", (int)(jnum(dl, "progress") * 100));
         else snprintf(dlstate, sizeof(dlstate), "Stream only");
 
-        ap_detail_info_pair info[8];
+        ap_detail_info_pair info[9];
         int ni = 0;
-        if (jstr(d, "author")[0]) info[ni++] = (ap_detail_info_pair){ "Author", jstr(d, "author") };
-        if (jstr(d, "narrator")[0]) info[ni++] = (ap_detail_info_pair){ "Narrator", jstr(d, "narrator") };
-        if (jstr(d, "series")[0]) info[ni++] = (ap_detail_info_pair){ "Series", jstr(d, "series") };
-        if (jstr(d, "year")[0]) info[ni++] = (ap_detail_info_pair){ "Year", jstr(d, "year") };
+        if (episode) {
+            if (jstr(d, "author")[0]) info[ni++] = (ap_detail_info_pair){ "Podcast", jstr(d, "author") };
+            if (jstr(d, "published")[0]) info[ni++] = (ap_detail_info_pair){ "Published", jstr(d, "published") };
+        } else {
+            if (jstr(d, "author")[0]) info[ni++] = (ap_detail_info_pair){ "Author", jstr(d, "author") };
+            if (jstr(d, "narrator")[0]) info[ni++] = (ap_detail_info_pair){ "Narrator", jstr(d, "narrator") };
+            if (jstr(d, "series")[0]) info[ni++] = (ap_detail_info_pair){ "Series", jstr(d, "series") };
+            if (jstr(d, "year")[0]) info[ni++] = (ap_detail_info_pair){ "Year", jstr(d, "year") };
+        }
         info[ni++] = (ap_detail_info_pair){ "Length", length };
         info[ni++] = (ap_detail_info_pair){ "Progress", progress };
-        info[ni++] = (ap_detail_info_pair){ "Chapters", chapters };
+        if (!episode || strcmp(chapters, "0") != 0) info[ni++] = (ap_detail_info_pair){ "Chapters", chapters };
         info[ni++] = (ap_detail_info_pair){ "Offline", dlstate };
 
         char *desc = strip_html(jstr(d, "description"));
@@ -423,28 +664,27 @@ void book_detail_screen(const char *item_id) {
         free(desc);
 
         if (r.action == AP_DETAIL_ACTION) {
-            char id[128];
-            snprintf(id, sizeof(id), "%s", item_id);
             cJSON_Delete(d);
-            play_item(id, 0, false);
+            play_item(id, ep, 0, false);
             continue;
         }
         if (r.action == AP_DETAIL_SECONDARY_ACTION) {
-            book_actions(d);
+            item_actions(d);
             cJSON_Delete(d);
             continue;
         }
         cJSON_Delete(d);
-        return;
+        break;
     }
+    free(body);
 }
 
 /* ── Downloads ───────────────────────────────────────────────────────────── */
 
 typedef struct {
-    cJSON *resp;
     ap_list_item *items;
     char (*trail)[32];
+    char (*keys)[260]; /* "itemId|episodeId" */
     int count;
     int jobs;
     Uint32 last_refresh;
@@ -457,6 +697,8 @@ static void dl_fill_job_trail(cJSON *job, char *t) {
     else snprintf(t, 32, "%d%%", (int)(jnum(job, "progress") * 100));
 }
 
+static void dl_key(char *out, const char *id, const char *ep) { snprintf(out, 260, "%s|%s", id, ep); }
+
 /* Live-update download percentages while the list is open. */
 static void dl_footer_update(ap_list_opts *opts, int cursor, void *userdata) {
     (void)opts; (void)cursor;
@@ -466,14 +708,14 @@ static void dl_footer_update(ap_list_opts *opts, int cursor, void *userdata) {
         v->last_refresh = SDL_GetTicks();
         cJSON *r = absd_call("/downloaded", NULL, NULL, 0);
         if (r) {
-            cJSON *jobs = cJSON_GetObjectItem(r, "jobs");
-            cJSON *done = cJSON_GetObjectItem(r, "items");
+            cJSON *jobs = cJSON_GetObjectItem(r, "jobs"), *done = cJSON_GetObjectItem(r, "items");
             for (int i = 0; i < v->jobs; i++) {
-                const char *id = v->items[i].metadata;
+                char k[260];
                 bool found = false;
                 cJSON *j;
                 cJSON_ArrayForEach(j, jobs) {
-                    if (strcmp(jstr(j, "itemId"), id) == 0) {
+                    dl_key(k, jstr(j, "itemId"), jstr(j, "episodeId"));
+                    if (strcmp(k, v->keys[i]) == 0) {
                         dl_fill_job_trail(j, v->trail[i]);
                         found = true;
                     }
@@ -481,7 +723,8 @@ static void dl_footer_update(ap_list_opts *opts, int cursor, void *userdata) {
                 if (!found) {
                     cJSON *b;
                     cJSON_ArrayForEach(b, done) {
-                        if (strcmp(jstr(b, "id"), id) == 0) snprintf(v->trail[i], 32, "Done");
+                        dl_key(k, jstr(b, "id"), jstr(b, "episodeId"));
+                        if (strcmp(k, v->keys[i]) == 0) snprintf(v->trail[i], 32, "Done");
                     }
                 }
             }
@@ -500,29 +743,29 @@ void downloads_screen(void) {
             show_message(err);
             return;
         }
-        cJSON *jobs = cJSON_GetObjectItem(r, "jobs");
-        cJSON *done = cJSON_GetObjectItem(r, "items");
-        dl_view v = { .resp = r, .jobs = cJSON_GetArraySize(jobs) };
+        cJSON *jobs = cJSON_GetObjectItem(r, "jobs"), *done = cJSON_GetObjectItem(r, "items");
+        dl_view v = { .jobs = cJSON_GetArraySize(jobs) };
         v.count = v.jobs + cJSON_GetArraySize(done);
         if (v.count == 0) {
             cJSON_Delete(r);
-            show_message("No downloads yet.\n\nOpen a book, press Y (MORE) and choose\n\"Download to SD card\" to listen offline.");
+            show_message("No downloads yet.\n\nOpen a book or episode, press Y (MORE) and\nchoose \"Download to SD card\" to listen offline.");
             return;
         }
         v.items = calloc((size_t)v.count, sizeof(*v.items));
         v.trail = calloc((size_t)v.count, sizeof(*v.trail));
+        v.keys = calloc((size_t)v.count, sizeof(*v.keys));
         int i = 0;
         cJSON *it;
         cJSON_ArrayForEach(it, jobs) {
             v.items[i].label = jstr(it, "title");
-            v.items[i].metadata = jstr(it, "itemId");
+            dl_key(v.keys[i], jstr(it, "itemId"), jstr(it, "episodeId"));
             dl_fill_job_trail(it, v.trail[i]);
             v.items[i].trailing_text = v.trail[i];
             i++;
         }
         cJSON_ArrayForEach(it, done) {
             v.items[i].label = jstr(it, "title");
-            v.items[i].metadata = jstr(it, "id");
+            dl_key(v.keys[i], jstr(it, "id"), jstr(it, "episodeId"));
             double p = jnum(it, "progress");
             if (jbool(it, "finished")) snprintf(v.trail[i], 32, "Done");
             else if (p > 0.005) snprintf(v.trail[i], 32, "%d%%", (int)(p * 100));
@@ -546,204 +789,51 @@ void downloads_screen(void) {
         ap_list_result lr;
         int ret = ap_list(&o, &lr);
 
-        char id[128] = "";
+        char key[260] = "";
         bool is_job = false;
         if (ret == AP_OK && lr.selected_index >= 0) {
-            snprintf(id, sizeof(id), "%s", v.items[lr.selected_index].metadata);
+            snprintf(key, sizeof(key), "%s", v.keys[lr.selected_index]);
             is_job = lr.selected_index < v.jobs;
             cursor = lr.selected_index;
         }
         int action = lr.action;
         free(v.items);
         free(v.trail);
+        free(v.keys);
         cJSON_Delete(r);
         if (ret != AP_OK) return;
-        if (!id[0]) continue;
+        if (!key[0]) continue;
 
-        char body[200];
-        snprintf(body, sizeof(body), "{\"id\":\"%s\"}", id);
+        char *bar = strchr(key, '|');
+        const char *ep = "";
+        if (bar) {
+            *bar = '\0';
+            ep = bar + 1;
+        }
+        char *body = jbody("id", key, "episodeId", ep, NULL);
         if (action == AP_ACTION_TRIGGERED) {
             if (is_job) {
                 absd_cmd("/download/cancel", body);
-            } else if (confirm("Remove this book from the SD card?", "REMOVE")) {
+            } else if (confirm("Remove this from the SD card?", "REMOVE")) {
                 cJSON *res = absd_call("/download/delete", body, err, sizeof(err));
                 if (res) cJSON_Delete(res);
                 else show_message(err);
             }
         } else {
-            book_detail_screen(id);
+            item_detail_screen(key, ep);
         }
+        free(body);
     }
 }
 
 /* ── Search ──────────────────────────────────────────────────────────────── */
 
-void search_screen(void) {
+void search_screen(const char *library_id) {
     ap_keyboard_result kb;
     if (ap_keyboard("", NULL, AP_KB_GENERAL, &kb) != AP_OK || !kb.text[0]) return;
-    cJSON *st = absd_status();
-    cJSON *b = cJSON_CreateObject();
-    cJSON_AddStringToObject(b, "library", st ? jstr(st, "libraryId") : "");
-    cJSON_AddStringToObject(b, "q", kb.text);
-    cJSON_Delete(st);
-    char *s = cJSON_PrintUnformatted(b);
-    cJSON_Delete(b);
+    char *body = jbody("library", library_id, "q", kb.text, NULL);
     char title[160];
     snprintf(title, sizeof(title), "Search: %.140s", kb.text);
-    book_list_screen(title, "/search", s, false);
-    free(s);
+    entry_list_screen(title, "/search", body, LIST_MIXED);
+    free(body);
 }
-
-/* ── Settings ────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    const char *label;
-    const char *key;
-    const int *values;
-    int count;
-} int_setting;
-
-static const int SKIP_BACK[] = { 5, 10, 15, 30, 45, 60 };
-static const int SKIP_FWD[] = { 10, 15, 30, 45, 60, 90 };
-static const int REWIND[] = { 0, 1, 2, 3, 5, 10 };
-
-static const char *HOTKEY_HELP =
-    "While a game is running (or in the NextUI menu)\n"
-    "these buttons control playback:\n\n"
-    "FN1 or SELECT+START  Play / pause\n"
-    "SELECT+L1  Skip back\n"
-    "SELECT+R1  Skip forward\n\n"
-    "The game also sees these presses.\n"
-    "Edit settings.json in .userdata/shared/Audiobookshelf\n"
-    "to change the buttons.";
-
-bool settings_screen(void) {
-    cJSON *st = absd_status();
-    if (!st) return false;
-    cJSON *set = settings_from_status(st);
-
-    char err[256];
-    cJSON *libs = absd_call("/libraries", NULL, err, sizeof(err));
-    int nlibs = libs ? cJSON_GetArraySize(libs) : 0;
-
-    int_setting ints[] = {
-        { "Skip back", "skipBack", SKIP_BACK, 6 },
-        { "Skip forward", "skipForward", SKIP_FWD, 6 },
-        { "Rewind on resume", "resumeRewind", REWIND, 6 },
-    };
-    enum { N_INTS = 3 };
-
-    /* Option storage. Apostrophe frees/replaces values only for keyboard and
-     * color items, so static strings are fine here. */
-    ap_option lib_opts[32];
-    int lib_sel = 0;
-    for (int i = 0; i < nlibs && i < 32; i++) {
-        cJSON *l = cJSON_GetArrayItem(libs, i);
-        lib_opts[i] = (ap_option){ .label = jstr(l, "name"), .value = jstr(l, "id") };
-        if (strcmp(jstr(l, "id"), jstr(st, "libraryId")) == 0) lib_sel = i;
-    }
-    if (nlibs > 32) nlibs = 32;
-
-    char int_labels[N_INTS][6][16];
-    ap_option int_opts[N_INTS][6];
-    int int_sel[N_INTS];
-    for (int k = 0; k < N_INTS; k++) {
-        int cur = (int)jnum(set, ints[k].key);
-        int_sel[k] = 0;
-        for (int i = 0; i < ints[k].count; i++) {
-            if (ints[k].values[i] == 0) snprintf(int_labels[k][i], 16, "Off");
-            else snprintf(int_labels[k][i], 16, "%ds", ints[k].values[i]);
-            int_opts[k][i] = (ap_option){ .label = int_labels[k][i], .value = int_labels[k][i] };
-            if (ints[k].values[i] == cur) int_sel[k] = i;
-        }
-    }
-    ap_option onoff[] = { { .label = "On", .value = "1" }, { .label = "Off", .value = "0" } };
-    cJSON *hk = cJSON_GetObjectItem(set, "hotkeys");
-    char account[300];
-    snprintf(account, sizeof(account), "%s @ %s", jstr(st, "username"), jstr(st, "server"));
-    ap_option account_opt[] = { { .label = "Log out", .value = "" } };
-    ap_option about_opt[] = { { .label = "", .value = "" } };
-    ap_option hotkey_help_opt[] = { { .label = "", .value = "" } };
-
-    ap_options_item items[10];
-    int n = 0, idx_lib = -1, idx_int = -1, idx_hk, idx_sleep, idx_account, idx_hkhelp, idx_about;
-    if (nlibs > 1) {
-        idx_lib = n;
-        items[n++] = (ap_options_item){ .label = "Library", .type = AP_OPT_STANDARD, .options = lib_opts,
-                                        .option_count = nlibs, .selected_option = lib_sel };
-    }
-    idx_int = n;
-    for (int k = 0; k < N_INTS; k++) {
-        items[n++] = (ap_options_item){ .label = ints[k].label, .type = AP_OPT_STANDARD, .options = int_opts[k],
-                                        .option_count = ints[k].count, .selected_option = int_sel[k] };
-    }
-    idx_hk = n;
-    items[n++] = (ap_options_item){ .label = "In-game controls", .type = AP_OPT_STANDARD, .options = onoff,
-                                    .option_count = 2, .selected_option = jbool(hk, "enabled") ? 0 : 1 };
-    idx_hkhelp = n;
-    items[n++] = (ap_options_item){ .label = "In-game buttons", .type = AP_OPT_CLICKABLE, .options = hotkey_help_opt, .option_count = 1 };
-    idx_sleep = n;
-    items[n++] = (ap_options_item){ .label = "Pause when device sleeps", .type = AP_OPT_STANDARD, .options = onoff,
-                                    .option_count = 2, .selected_option = jbool(set, "pauseOnSleep") ? 0 : 1 };
-    idx_account = n;
-    items[n++] = (ap_options_item){ .label = account, .type = AP_OPT_CLICKABLE, .options = account_opt, .option_count = 1 };
-    idx_about = n;
-    items[n++] = (ap_options_item){ .label = "About", .type = AP_OPT_CLICKABLE, .options = about_opt, .option_count = 1 };
-
-    ap_footer_item footer[] = {
-        { .button = AP_BTN_B, .label = "SAVE" },
-        { .button = AP_BTN_A, .label = "SELECT", .is_confirm = true },
-    };
-    ap_options_list_opts o = { .title = "Settings", .items = items, .item_count = n, .footer = footer,
-                               .footer_count = 2, .status_bar = &g_status_bar };
-    bool logged_out = false;
-    for (;;) {
-        ap_options_list_result r = {0};
-        int ret = ap_options_list(&o, &r);
-        o.initial_selected_index = r.focused_index;
-        o.visible_start_index = r.visible_start_index;
-        if (ret != AP_OK) break;
-        if (r.action != AP_ACTION_SELECTED) continue;
-        if (r.focused_index == idx_account) {
-            if (confirm("Log out?\nDownloads stay on the SD card.", "LOG OUT")) {
-                absd_cmd("/logout", NULL);
-                logged_out = true;
-                break;
-            }
-        } else if (r.focused_index == idx_hkhelp) {
-            show_message(HOTKEY_HELP);
-        } else if (r.focused_index == idx_about) {
-            char msg[512];
-            snprintf(msg, sizeof(msg),
-                     "Audiobookshelf for NextUI\nversion %s\n\n"
-                     "Short press POWER to turn the screen off\n"
-                     "while listening. Hold POWER to shut down.\n\n"
-                     "Pending offline syncs: %d",
-                     jstr(st, "version"), (int)jnum(st, "pendingSyncs"));
-            show_message(msg);
-        }
-    }
-
-    if (!logged_out) {
-        cJSON *b = cJSON_CreateObject();
-        cJSON *s = cJSON_AddObjectToObject(b, "settings");
-        if (idx_lib >= 0) cJSON_AddStringToObject(s, "libraryId", lib_opts[items[idx_lib].selected_option].value);
-        for (int k = 0; k < N_INTS; k++) {
-            cJSON_AddNumberToObject(s, ints[k].key, ints[k].values[items[idx_int + k].selected_option]);
-        }
-        cJSON *hko = cJSON_Duplicate(hk, true);
-        if (!hko) hko = cJSON_CreateObject();
-        cJSON_DeleteItemFromObject(hko, "enabled");
-        cJSON_AddBoolToObject(hko, "enabled", items[idx_hk].selected_option == 0);
-        cJSON_AddItemToObject(s, "hotkeys", hko);
-        cJSON_AddBoolToObject(s, "pauseOnSleep", items[idx_sleep].selected_option == 0);
-        char *str = cJSON_PrintUnformatted(b);
-        absd_cmd("/settings", str);
-        free(str);
-        cJSON_Delete(b);
-    }
-    cJSON_Delete(libs);
-    cJSON_Delete(st);
-    return logged_out;
-}
-

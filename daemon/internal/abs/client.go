@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,6 +178,35 @@ func (c *Client) Login(ctx context.Context, server, username, password string) e
 	return nil
 }
 
+// LoginAPIKey signs in with an API key (Settings → API Keys on the server).
+// This is also how accounts that only use SSO can sign in.
+func (c *Client) LoginAPIKey(ctx context.Context, server, key string) error {
+	base, err := NormalizeServer(server)
+	if err != nil {
+		return err
+	}
+	key = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), "Bearer "))
+	if key == "" {
+		return errors.New("API key is empty")
+	}
+	prev := c.Credentials()
+	c.SetCredentials(Credentials{Server: base, LegacyToken: key})
+	me, err := c.Me(ctx)
+	if err != nil {
+		c.SetCredentials(prev)
+		if errors.Is(err, ErrAuth) {
+			return fmt.Errorf("%w: the server rejected that API key", ErrAuth)
+		}
+		return err
+	}
+	cr := Credentials{Server: base, Username: me.Username, UserID: me.ID, LegacyToken: key}
+	c.SetCredentials(cr)
+	if c.onUpdate != nil {
+		c.onUpdate(cr)
+	}
+	return nil
+}
+
 // Logout drops the tokens but remembers server and username for next login.
 func (c *Client) Logout() {
 	old := c.Credentials()
@@ -338,44 +368,122 @@ func (c *Client) Libraries(ctx context.Context) ([]Library, error) {
 	return r.Libraries, err
 }
 
-// LibraryItems fetches one page. sort is an Audiobookshelf sort key such as
-// "media.metadata.title" or "addedAt".
-func (c *Client) LibraryItems(ctx context.Context, libraryID string, page, limit int, sort string, desc bool) (ItemsPage, error) {
+// ItemsQuery selects a page of library items. Sort is an Audiobookshelf
+// sort key such as "media.metadata.title", "addedAt" or "sequence"; Filter is
+// e.g. "series.<base64 id>".
+type ItemsQuery struct {
+	Page, Limit int
+	Sort        string
+	Desc        bool
+	Filter      string
+}
+
+func (c *Client) LibraryItems(ctx context.Context, libraryID string, iq ItemsQuery) (ItemsPage, error) {
 	q := url.Values{}
-	q.Set("limit", strconv.Itoa(limit))
-	q.Set("page", strconv.Itoa(page))
+	q.Set("limit", strconv.Itoa(iq.Limit))
+	q.Set("page", strconv.Itoa(iq.Page))
 	q.Set("minified", "1")
 	q.Set("include", "progress")
-	if sort != "" {
-		q.Set("sort", sort)
+	if iq.Sort != "" {
+		q.Set("sort", iq.Sort)
 	}
-	if desc {
+	if iq.Desc {
 		q.Set("desc", "1")
+	}
+	if iq.Filter != "" {
+		q.Set("filter", iq.Filter)
 	}
 	var p ItemsPage
 	err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/items?"+q.Encode(), nil, &p)
 	return p, err
 }
 
-func (c *Client) Search(ctx context.Context, libraryID, query string) ([]LibraryItem, error) {
+// SeriesFilter is the items filter selecting one series.
+func SeriesFilter(seriesID string) string {
+	return "series." + base64.StdEncoding.EncodeToString([]byte(seriesID))
+}
+
+func (c *Client) Search(ctx context.Context, libraryID, query string) (*SearchResult, error) {
 	q := url.Values{}
 	q.Set("q", query)
 	q.Set("limit", "50")
-	var r searchResponse
+	var r SearchResult
 	if err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/search?"+q.Encode(), nil, &r); err != nil {
 		return nil, err
 	}
-	items := make([]LibraryItem, 0, len(r.Book))
-	for _, b := range r.Book {
-		items = append(items, b.LibraryItem)
-	}
-	return items, nil
+	return &r, nil
 }
 
 func (c *Client) ItemsInProgress(ctx context.Context) ([]LibraryItem, error) {
 	var r itemsInProgressResponse
 	err := c.doJSON(ctx, http.MethodGet, "/api/me/items-in-progress", nil, &r)
 	return r.LibraryItems, err
+}
+
+func (c *Client) RecentEpisodes(ctx context.Context, libraryID string) ([]Episode, error) {
+	var r recentEpisodesResponse
+	err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/recent-episodes?limit=50", nil, &r)
+	return r.Episodes, err
+}
+
+// Series lists every series in a library (each with its books).
+func (c *Client) Series(ctx context.Context, libraryID string) ([]Series, error) {
+	var all []Series
+	for page := 0; ; page++ {
+		var p seriesPage
+		path := fmt.Sprintf("/api/libraries/%s/series?limit=100&page=%d&minified=1&sort=name", url.PathEscape(libraryID), page)
+		if err := c.doJSON(ctx, http.MethodGet, path, nil, &p); err != nil {
+			return nil, err
+		}
+		all = append(all, p.Results...)
+		if len(p.Results) < 100 || len(all) >= p.Total {
+			return all, nil
+		}
+	}
+}
+
+func (c *Client) Authors(ctx context.Context, libraryID string) ([]Author, error) {
+	var r struct {
+		Authors []Author `json:"authors"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/authors?minified=1", nil, &r)
+	return r.Authors, err
+}
+
+func (c *Client) Author(ctx context.Context, id string) (*Author, error) {
+	var a Author
+	if err := c.doJSON(ctx, http.MethodGet, "/api/authors/"+url.PathEscape(id)+"?include=items", nil, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (c *Client) Collections(ctx context.Context, libraryID string) ([]Collection, error) {
+	var p collectionsPage
+	err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/collections?limit=500", nil, &p)
+	return p.Results, err
+}
+
+func (c *Client) Collection(ctx context.Context, id string) (*Collection, error) {
+	var col Collection
+	if err := c.doJSON(ctx, http.MethodGet, "/api/collections/"+url.PathEscape(id), nil, &col); err != nil {
+		return nil, err
+	}
+	return &col, nil
+}
+
+func (c *Client) Playlists(ctx context.Context, libraryID string) ([]Playlist, error) {
+	var p playlistsPage
+	err := c.doJSON(ctx, http.MethodGet, "/api/libraries/"+url.PathEscape(libraryID)+"/playlists?limit=500", nil, &p)
+	return p.Results, err
+}
+
+func (c *Client) Playlist(ctx context.Context, id string) (*Playlist, error) {
+	var pl Playlist
+	if err := c.doJSON(ctx, http.MethodGet, "/api/playlists/"+url.PathEscape(id), nil, &pl); err != nil {
+		return nil, err
+	}
+	return &pl, nil
 }
 
 func (c *Client) Item(ctx context.Context, id string) (*LibraryItem, error) {
@@ -387,11 +495,31 @@ func (c *Client) Item(ctx context.Context, id string) (*LibraryItem, error) {
 	return &it, nil
 }
 
-func (c *Client) UpdateProgress(ctx context.Context, id string, patch map[string]any) error {
-	return c.doJSON(ctx, http.MethodPatch, "/api/me/progress/"+url.PathEscape(id), patch, nil)
+func progressPath(id, episodeID string) string {
+	p := "/api/me/progress/" + url.PathEscape(id)
+	if episodeID != "" {
+		p += "/" + url.PathEscape(episodeID)
+	}
+	return p
 }
 
-func (c *Client) StartPlay(ctx context.Context, id string) (*PlaySession, error) {
+func (c *Client) UpdateProgress(ctx context.Context, id, episodeID string, patch map[string]any) error {
+	return c.doJSON(ctx, http.MethodPatch, progressPath(id, episodeID), patch, nil)
+}
+
+func (c *Client) AddBookmark(ctx context.Context, id string, time float64, title string) error {
+	return c.doJSON(ctx, http.MethodPost, "/api/me/item/"+url.PathEscape(id)+"/bookmark",
+		map[string]any{"time": time, "title": title}, nil)
+}
+
+func (c *Client) DeleteBookmark(ctx context.Context, id string, time float64) error {
+	return c.doJSON(ctx, http.MethodDelete, "/api/me/item/"+url.PathEscape(id)+"/bookmark/"+
+		strconv.FormatFloat(time, 'f', -1, 64), nil, nil)
+}
+
+// StartPlay opens a playback session for a book, or for one podcast episode
+// when episodeID is set.
+func (c *Client) StartPlay(ctx context.Context, id, episodeID string) (*PlaySession, error) {
 	req := map[string]any{
 		"deviceInfo":      c.Device,
 		"forceDirectPlay": true,
@@ -402,8 +530,12 @@ func (c *Client) StartPlay(ctx context.Context, id string) (*PlaySession, error)
 			"audio/x-m4a", "audio/x-m4b", "audio/webm", "audio/wav", "audio/x-ms-wma",
 		},
 	}
+	path := "/api/items/" + url.PathEscape(id) + "/play"
+	if episodeID != "" {
+		path += "/" + url.PathEscape(episodeID)
+	}
 	var s PlaySession
-	if err := c.doJSON(ctx, http.MethodPost, "/api/items/"+url.PathEscape(id)+"/play", req, &s); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, path, req, &s); err != nil {
 		return nil, err
 	}
 	return &s, nil

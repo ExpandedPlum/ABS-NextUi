@@ -5,14 +5,14 @@ An [Audiobookshelf](https://www.audiobookshelf.org/) client pak for
 which shares the `tg5040` platform). It's inspired by
 [AudioBooth](https://github.com/AudioBooth/AudioBooth): browse your library,
 stream or download books, and listen with the **screen off** or **while you
-play a game**.
+play a game**. Podcasts work too.
 
 <p>
 <img src="docs/screenshots/home.png" width="49%"> <img src="docs/screenshots/now-playing.png" width="49%">
-<img src="docs/screenshots/library.png" width="49%"> <img src="docs/screenshots/book.png" width="49%">
+<img src="docs/screenshots/podcast.png" width="49%"> <img src="docs/screenshots/phone-login.png" width="49%">
 </p>
 
-> **Status: v0.1.0, not yet tested on real hardware.** Everything was built
+> **Status: v0.2.0, not yet tested on real hardware.** Everything was built
 > with the official NextUI toolchain. The playback service and the device
 > ffmpeg were tested end to end against a real Audiobookshelf server, both
 > natively and under arm64 emulation. The UI was checked visually at the
@@ -22,20 +22,29 @@ play a game**.
 
 ## Features
 
-- Log in with username and password. Works with both new (access/refresh
-  token) and legacy Audiobookshelf auth.
-- **Continue Listening**, **Library** (sort by title, author, date added or
-  length), **Recently Added**, and **Search**.
-- Book pages with cover, author, narrator, series, length, progress and
-  description.
+- **Sign in** with username and password, with an **API key**, or **from your
+  phone**. The phone option shows a QR code: open it on a phone on the same
+  Wi-Fi and type your details there instead of on the handheld keyboard.
+  Works with new (access/refresh token) and legacy Audiobookshelf auth.
+- **Books**: Continue Listening, Library (sort by title, author, date added or
+  length), **Series** (in reading order), **Authors**, **Collections**,
+  **Playlists**, Recently Added, and **Search** (finds books, authors and
+  series).
+- **Podcasts**: shows with their episodes (newest first), Latest Episodes,
+  playlists and search. Each episode has its own progress and can be
+  downloaded on its own.
+- Book and episode pages with cover, author or podcast, narrator, series,
+  length, progress and description.
 - Streaming playback of m4b/m4a/mp3/flac/ogg/opus/wma, including books split
   across many files.
 - Chapters: L1/R1 to jump, or pick from a list.
+- **Bookmarks**: add one at the current spot, list them, jump to one, or delete
+  one. Bookmarks added offline are kept on the device and uploaded later.
 - Pitch-preserving **playback speed**, 0.5× to 3×.
 - **Sleep timer**: 5 minutes to 2 hours, or end of chapter.
 - Configurable skip back/forward, with a small rewind when resuming.
-- **Downloads** to the SD card for offline listening, resumable if
-  interrupted.
+- **Downloads** of books and episodes to the SD card for offline listening,
+  resumable if interrupted. Downloaded podcasts can be browsed offline.
 - **Progress sync** with the server every 15 s and on pause. Listening done
   offline is queued and uploaded when the server is reachable again.
 - **Screen off**: a short press of POWER turns the backlight off and audio
@@ -52,8 +61,17 @@ play a game**.
 2. Unzip it and copy the `Audiobookshelf.pak` folder to
    `SD:/Tools/tg5040/` on your SD card.
 3. On the device, open **Tools → Audiobookshelf**.
-4. Enter your server address (e.g. `192.168.1.20:13378` or
-   `https://abs.example.com`), username and password, then choose **Log In**.
+4. Sign in. The easiest way is **Sign in from your phone**: scan the QR code
+   with a phone on the same Wi-Fi and fill in the form there. You can also
+   enter the server address (e.g. `192.168.1.20:13378` or
+   `https://abs.example.com`), username and password on the device.
+
+### Accounts that use SSO / OpenID
+
+The handheld has no web browser to complete an SSO sign-in. Use an **API
+key** instead: in Audiobookshelf go to *Settings → API Keys*, create a key for
+your user, and paste it into the phone sign-in page (choose *API key*). If
+you aren't the server admin, ask them to create one for you.
 
 ## Controls
 
@@ -68,14 +86,17 @@ Holding POWER saves progress and shuts down. MENU shows help.
 | LEFT / RIGHT | Skip back / forward (15 s / 30 s by default) |
 | L1 / R1 | Previous / next chapter |
 | X | Chapter list |
-| Y | Sleep timer |
-| SELECT | Playback speed |
-| START | Stop playback |
+| START | MORE: add bookmark, bookmarks, sleep timer, speed, stop |
+| Y | Sleep timer (shortcut) |
+| SELECT | Playback speed (shortcut) |
 | B | Back to browsing (keeps playing) |
 
+**Home:** Y switches library (e.g. between Books and Podcasts), and X
+plays/pauses the loaded book.
+
 **Lists:** A opens, X plays straight away, Y changes sort (Library), B goes
-back. On a book page, Y (MORE) offers: play from the beginning or a chapter,
-download/remove, and mark finished.
+back. On a book or episode page, Y (MORE) offers: play from the beginning or a
+chapter, bookmarks, download/remove, and mark finished.
 
 **Leaving the app:** press B on the home screen and choose *Keep listening*
 to carry on in the background, or *Stop playback and exit*.
@@ -128,6 +149,9 @@ e.g. `"toggle": "FN2,SELECT+Y"`.
   own. A short press sets the panel brightness to 0 through `/dev/disp`, the
   same ioctl NextUI uses. It also drops the CPU to its lowest preset and
   filters out all input until the next press.
+- **Phone sign-in** serves a one-time page on port 8737 of the device's Wi-Fi
+  address, under a random 12-character path. It accepts one successful sign-in
+  and then closes; it also closes after 10 minutes or when you cancel.
 - A NextUI `pre-sleep.d` hook (`.userdata/tg5040/.hooks/pre-sleep.d/`)
   pauses and syncs before the device suspends.
 
@@ -136,8 +160,8 @@ Files on the SD card:
 | Path | Contents |
 |------|----------|
 | `Tools/tg5040/Audiobookshelf.pak/` | The pak |
-| `.userdata/shared/Audiobookshelf/` | Settings, login tokens, local progress, offline sync queue, cover cache |
-| `Audiobooks/` | Downloaded books (one folder per book, with `manifest.json`) |
+| `.userdata/shared/Audiobookshelf/` | Settings, login tokens, local progress, offline sync and bookmark queues, cover cache |
+| `Audiobooks/` | Downloaded books (one folder per book, with `manifest.json`); episodes under `Audiobooks/Podcasts/` |
 | `.userdata/tg5040/logs/Audiobookshelf*.txt` | UI and daemon logs |
 
 ## Testing on the device
@@ -195,16 +219,22 @@ cd daemon && go test ./...        # unit tests
 scripts/integration-test.sh       # real Audiobookshelf server in Docker
 ```
 
-The integration test streams a chaptered m4b and a multi-file mp3 book. It
-checks chapter tracking, track changes, server progress and auto-finish, then
-downloads a book, plays it with the server unreachable, and verifies the
-queued progress uploads once the server is back.
+The integration test starts a real server with a book library and a podcast
+library, then checks:
+
+- chapters, track changes, server progress and auto-finish;
+- downloading, offline playback, and the queued progress uploading on reconnect;
+- series order, authors, collections and search;
+- bookmarks;
+- podcast episodes, including finishing one and the Latest Episodes list;
+- API-key login and the phone sign-in page.
 
 ## Not yet supported
 
-- Podcasts (the libraries are hidden).
-- OpenID/SSO login and API-key login.
-- Bookmarks, collections, series and author browsing.
+- True SSO/OpenID sign-in on the device (use an API key; see above).
+- Narrator, genre and tag browsing.
+- Creating or editing collections and playlists (they're read-only here).
+- Adding new podcast episodes from feeds (do that on the server).
 
 ## Credits
 

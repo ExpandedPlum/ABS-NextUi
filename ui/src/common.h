@@ -53,18 +53,22 @@ cJSON      *call_with_spinner(const char *message, const char *path, const char 
 
 /* ── screens ─────────────────────────────────────────────────────────────── */
 
+enum { LIST_SORTABLE = 1, LIST_MIXED = 2 };
+
+char *jbody(const char *key, ...);       /* {"k":"v",...} from NULL-terminated pairs; caller frees */
 bool login_screen(void);                 /* true once logged in */
 void now_playing_screen(void);
-void book_list_screen(const char *title, const char *path, const char *body, bool sortable);
-void book_detail_screen(const char *item_id);
+void entry_list_screen(const char *title, const char *path, const char *body, int flags);
+void item_detail_screen(const char *item_id, const char *episode_id);
+void bookmarks_screen(const char *item_id, bool in_player); /* in_player: jump instead of opening the player */
 void downloads_screen(void);
-bool settings_screen(void);            /* true when the user logged out */
-void search_screen(void);
+bool settings_screen(void);              /* true when the user logged out */
+void search_screen(const char *library_id);
 void chapters_picker(void);
 void speed_picker(void);
 void sleep_picker(void);
-/* Start playback of an item (optionally at position) and open Now Playing. */
-void play_item(const char *item_id, double position, bool use_position);
+/* Start a book or episode (optionally at position) and open Now Playing. */
+void play_item(const char *item_id, const char *episode_id, double position, bool use_position);
 
 extern ap_status_bar_opts g_status_bar;
 

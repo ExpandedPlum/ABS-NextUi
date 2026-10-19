@@ -45,12 +45,13 @@ type Chapter struct {
 }
 
 type Media struct {
-	ItemID   string
-	Title    string
-	Author   string
-	Duration float64
-	Tracks   []Track
-	Chapters []Chapter
+	ItemID    string
+	EpisodeID string
+	Title     string
+	Author    string
+	Duration  float64
+	Tracks    []Track
+	Chapters  []Chapter
 }
 
 type Config struct {

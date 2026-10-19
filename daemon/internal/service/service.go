@@ -23,10 +23,11 @@ import (
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/store"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type current struct {
 	itemID        string
+	episodeID     string
 	media         *player.Media
 	serverSession string
 	sessionBroken bool
@@ -65,6 +66,7 @@ type Service struct {
 
 	progCache   map[string]abs.MediaProgress
 	progCacheAt time.Time
+	phone       *phoneServer
 }
 
 // OnSettings registers a callback run after settings change.
@@ -302,6 +304,15 @@ func (s *Service) noteNetErr(err error) {
 	s.setOnline(false)
 }
 
+// netCtx shortens server calls while the server is known to be unreachable,
+// so offline browsing falls back to cached data quickly.
+func (s *Service) netCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.Online() {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, 4*time.Second)
+}
+
 // CheckOnline pings the server to refresh the online flag.
 func (s *Service) CheckOnline(ctx context.Context) bool {
 	if !s.Client.LoggedIn() {
@@ -318,12 +329,18 @@ func (s *Service) CheckOnline(ctx context.Context) bool {
 // ---------------------------------------------------------------------------
 // Playback
 
-func (s *Service) Play(ctx context.Context, itemID string, from *float64) error {
+// key identifies the loaded book or episode in local progress and downloads.
+func (c *current) key() string { return downloads.Key(c.itemID, c.episodeID) }
+
+// Play starts a book, or a podcast episode when episodeID is set.
+func (s *Service) Play(ctx context.Context, itemID, episodeID string, from *float64) error {
 	s.mu.Lock()
 	cur := s.cur
 	s.mu.Unlock()
 
-	if cur != nil && cur.itemID == itemID {
+	// Reuse the loaded book unless it is streaming and a download now exists.
+	if cur != nil && cur.itemID == itemID && cur.episodeID == episodeID &&
+		(cur.isLocalFiles || s.DL.Get(itemID, episodeID) == nil) {
 		if from != nil {
 			if err := s.Eng.Seek(*from); err != nil {
 				return err
@@ -337,7 +354,7 @@ func (s *Service) Play(ctx context.Context, itemID string, from *float64) error 
 		s.Stop()
 	}
 
-	man := s.DL.Get(itemID)
+	man := s.DL.Get(itemID, episodeID)
 	var sess *abs.PlaySession
 	// A downloaded book shouldn't wait on a server that's known to be down.
 	if s.Client.LoggedIn() && (man == nil || s.Online()) {
@@ -347,7 +364,7 @@ func (s *Service) Play(ctx context.Context, itemID string, from *float64) error 
 		}
 		pctx, cancel := context.WithTimeout(ctx, timeout)
 		var err error
-		sess, err = s.Client.StartPlay(pctx, itemID)
+		sess, err = s.Client.StartPlay(pctx, itemID, episodeID)
 		cancel()
 		s.noteNetErr(err)
 		if err != nil {
@@ -389,7 +406,7 @@ func (s *Service) Play(ctx context.Context, itemID string, from *float64) error 
 	}
 
 	pos := 0.0
-	lp, haveLocal := s.St.GetProgress(itemID)
+	lp, haveLocal := s.St.GetProgress(downloads.Key(itemID, episodeID))
 	switch {
 	case from != nil:
 		pos = *from
@@ -403,12 +420,18 @@ func (s *Service) Play(ctx context.Context, itemID string, from *float64) error 
 	}
 
 	now := store.NowMs()
+	mediaType := "book"
+	if episodeID != "" {
+		mediaType = "podcast"
+	}
+	media.EpisodeID = episodeID
 	nc := &current{
 		itemID:       itemID,
+		episodeID:    episodeID,
 		media:        media,
 		isLocalFiles: man != nil,
 		local: abs.LocalSession{
-			ID: store.NewID(), LibraryItemID: itemID, MediaType: "book",
+			ID: store.NewID(), LibraryItemID: itemID, EpisodeID: episodeID, MediaType: mediaType,
 			DisplayTitle: media.Title, DisplayAuthor: media.Author,
 			Duration: media.Duration, PlayMethod: 3, MediaPlayer: "ffmpeg",
 			DeviceInfo: s.Client.Device, StartTime: pos, CurrentTime: pos,
@@ -631,7 +654,7 @@ func (s *Service) onPlayerEvent(ev player.Event) {
 			return
 		}
 		s.Sync(false)
-		s.markFinished(cur.itemID, true)
+		s.markFinished(cur.itemID, cur.episodeID, true)
 	case player.EventError:
 		go s.Sync(false)
 	}
@@ -662,13 +685,17 @@ func (s *Service) Sync(final bool) {
 	cur.lastSync = time.Now()
 	s.mu.Unlock()
 
-	s.St.SetProgress(cur.itemID, store.LocalProgress{CurrentTime: pos, Duration: cur.media.Duration, UpdatedAt: now, Dirty: true})
+	s.St.SetProgress(cur.key(), store.LocalProgress{CurrentTime: pos, Duration: cur.media.Duration, UpdatedAt: now, Dirty: true})
 	if !s.Client.LoggedIn() {
 		s.St.PutPending(ls)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeout := 10 * time.Second
+	if !s.Online() {
+		timeout = 3 * time.Second // likely to fail; queue it without holding things up
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	var err error
 	if sessID != "" && !broken {
@@ -693,12 +720,15 @@ func (s *Service) Sync(final bool) {
 		return
 	}
 	s.St.DropPending(ls.ID)
-	s.St.SetProgress(cur.itemID, store.LocalProgress{CurrentTime: pos, Duration: cur.media.Duration, UpdatedAt: now})
+	s.St.SetProgress(cur.key(), store.LocalProgress{CurrentTime: pos, Duration: cur.media.Duration, UpdatedAt: now})
 	s.invalidateProgress()
 }
 
 // flushPending uploads listening that happened while offline.
 func (s *Service) flushPending() {
+	if s.Client.LoggedIn() {
+		s.flushBookmarks()
+	}
 	pend := s.St.PendingSessions()
 	if len(pend) == 0 || !s.Client.LoggedIn() {
 		return
@@ -722,22 +752,24 @@ func (s *Service) flushPending() {
 			return
 		}
 		s.St.DropPending(ls.ID)
-		if lp, ok := s.St.GetProgress(ls.LibraryItemID); ok && lp.UpdatedAt <= ls.UpdatedAt {
+		key := downloads.Key(ls.LibraryItemID, ls.EpisodeID)
+		if lp, ok := s.St.GetProgress(key); ok && lp.UpdatedAt <= ls.UpdatedAt {
 			lp.Dirty = false
-			s.St.SetProgress(ls.LibraryItemID, lp)
+			s.St.SetProgress(key, lp)
 		}
 		log.Printf("uploaded offline session %s", ls.ID)
 	}
 }
 
-func (s *Service) markFinished(itemID string, finished bool) error {
-	lp, _ := s.St.GetProgress(itemID)
+func (s *Service) markFinished(itemID, episodeID string, finished bool) error {
+	key := downloads.Key(itemID, episodeID)
+	lp, _ := s.St.GetProgress(key)
 	lp.Finished = finished
 	lp.UpdatedAt = store.NowMs()
 	if !finished {
 		lp.CurrentTime = 0
 	}
-	s.St.SetProgress(itemID, lp)
+	s.St.SetProgress(key, lp)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	patch := map[string]any{"isFinished": finished}
@@ -745,20 +777,20 @@ func (s *Service) markFinished(itemID string, finished bool) error {
 		patch["currentTime"] = 0
 		patch["progress"] = 0
 	}
-	err := s.Client.UpdateProgress(ctx, itemID, patch)
+	err := s.Client.UpdateProgress(ctx, itemID, episodeID, patch)
 	s.noteNetErr(err)
 	s.invalidateProgress()
 	return err
 }
 
-func (s *Service) MarkFinished(itemID string, finished bool) error {
+func (s *Service) MarkFinished(itemID, episodeID string, finished bool) error {
 	s.mu.Lock()
-	playing := s.cur != nil && s.cur.itemID == itemID
+	playing := s.cur != nil && s.cur.itemID == itemID && s.cur.episodeID == episodeID
 	s.mu.Unlock()
 	if playing && finished {
 		s.Stop()
 	}
-	return s.markFinished(itemID, finished)
+	return s.markFinished(itemID, episodeID, finished)
 }
 
 // PreSleep runs from NextUI's pre-sleep hook: pause and push progress before
@@ -810,10 +842,8 @@ func sanitizeID(id string) string {
 // EnsureCover returns a local cover path, downloading it if needed. Returns
 // "" when no cover is available.
 func (s *Service) EnsureCover(ctx context.Context, id string) string {
-	if man := s.DL.Get(id); man != nil {
-		if _, err := os.Stat(man.CoverPath()); err == nil {
-			return man.CoverPath()
-		}
+	if p := s.DL.CoverFor(id); p != "" {
+		return p
 	}
 	path := s.coverFile(id)
 	if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {

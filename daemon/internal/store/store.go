@@ -87,6 +87,8 @@ type Store struct {
 	DeviceID string
 	Progress map[string]LocalProgress
 	Pending  map[string]abs.LocalSession // session id -> unsynced listening
+	// Bookmarks made while offline, uploaded when the server is reachable.
+	Bookmarks []abs.Bookmark
 }
 
 func Open(dir, sdcard string) (*Store, error) {
@@ -103,6 +105,7 @@ func Open(dir, sdcard string) (*Store, error) {
 	_ = readJSON(s.path("credentials.json"), &s.Creds)
 	_ = readJSON(s.path("progress.json"), &s.Progress)
 	_ = readJSON(s.path("pending-sessions.json"), &s.Pending)
+	_ = readJSON(s.path("pending-bookmarks.json"), &s.Bookmarks)
 	var dev struct {
 		ID string `json:"deviceId"`
 	}
@@ -199,6 +202,41 @@ func (s *Store) pendingCopyLocked() map[string]abs.LocalSession {
 		cp[k] = v
 	}
 	return cp
+}
+
+func (s *Store) AddPendingBookmark(b abs.Bookmark) {
+	s.mu.Lock()
+	s.Bookmarks = append(s.Bookmarks, b)
+	cp := append([]abs.Bookmark(nil), s.Bookmarks...)
+	s.mu.Unlock()
+	_ = writeJSON(s.path("pending-bookmarks.json"), cp)
+}
+
+func (s *Store) PendingBookmarks() []abs.Bookmark {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]abs.Bookmark(nil), s.Bookmarks...)
+}
+
+// DropPendingBookmark removes a queued bookmark; false if there was none.
+func (s *Store) DropPendingBookmark(itemID string, t float64) bool {
+	s.mu.Lock()
+	found := false
+	kept := s.Bookmarks[:0]
+	for _, b := range s.Bookmarks {
+		if !found && b.LibraryItemID == itemID && b.Time == t {
+			found = true
+			continue
+		}
+		kept = append(kept, b)
+	}
+	s.Bookmarks = kept
+	cp := append([]abs.Bookmark(nil), kept...)
+	s.mu.Unlock()
+	if found {
+		_ = writeJSON(s.path("pending-bookmarks.json"), cp)
+	}
+	return found
 }
 
 func NowMs() int64 { return time.Now().UnixMilli() }

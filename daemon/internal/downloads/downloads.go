@@ -35,6 +35,7 @@ type ManifestTrack struct {
 
 type Manifest struct {
 	ItemID       string           `json:"itemId"`
+	EpisodeID    string           `json:"episodeId,omitempty"`
 	Title        string           `json:"title"`
 	Subtitle     string           `json:"subtitle,omitempty"`
 	Author       string           `json:"author"`
@@ -46,14 +47,25 @@ type Manifest struct {
 	Chapters     []player.Chapter `json:"chapters"`
 	Tracks       []ManifestTrack  `json:"tracks"`
 	DownloadedAt int64            `json:"downloadedAt"`
+	PublishedAt  int64            `json:"publishedAt,omitempty"`
 
 	Dir string `json:"-"`
 }
 
 func (m *Manifest) CoverPath() string { return filepath.Join(m.Dir, "cover.jpg") }
 
+func (m *Manifest) Key() string { return Key(m.ItemID, m.EpisodeID) }
+
+// Key identifies a download: a book, or one episode of a podcast.
+func Key(itemID, episodeID string) string {
+	if episodeID == "" {
+		return itemID
+	}
+	return itemID + "|" + episodeID
+}
+
 func (m *Manifest) Media() *player.Media {
-	pm := &player.Media{ItemID: m.ItemID, Title: m.Title, Author: m.Author, Duration: m.Duration, Chapters: m.Chapters}
+	pm := &player.Media{ItemID: m.ItemID, EpisodeID: m.EpisodeID, Title: m.Title, Author: m.Author, Duration: m.Duration, Chapters: m.Chapters}
 	for _, t := range m.Tracks {
 		pm.Tracks = append(pm.Tracks, player.Track{StartOffset: t.StartOffset, Duration: t.Duration, Source: filepath.Join(m.Dir, t.File)})
 	}
@@ -61,11 +73,12 @@ func (m *Manifest) Media() *player.Media {
 }
 
 type Job struct {
-	ItemID   string  `json:"itemId"`
-	Title    string  `json:"title"`
-	State    string  `json:"state"` // queued, downloading, error
-	Progress float64 `json:"progress"`
-	Error    string  `json:"error,omitempty"`
+	ItemID    string  `json:"itemId"`
+	EpisodeID string  `json:"episodeId,omitempty"`
+	Title     string  `json:"title"`
+	State     string  `json:"state"` // queued, downloading, error
+	Progress  float64 `json:"progress"`
+	Error     string  `json:"error,omitempty"`
 }
 
 type Manager struct {
@@ -92,28 +105,43 @@ func (m *Manager) root() string { return m.st.GetSettings().DownloadsDir }
 // Rescan reloads completed downloads from disk.
 func (m *Manager) Rescan() {
 	found := map[string]*Manifest{}
-	entries, _ := os.ReadDir(m.root())
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		dir := filepath.Join(m.root(), e.Name())
+	dirs, _ := filepath.Glob(filepath.Join(m.root(), "*", "manifest.json"))
+	eps, _ := filepath.Glob(filepath.Join(m.root(), "Podcasts", "*", "*", "manifest.json"))
+	for _, mf := range append(dirs, eps...) {
 		var man Manifest
-		if err := store.ReadJSON(filepath.Join(dir, "manifest.json"), &man); err != nil || man.ItemID == "" {
+		if err := store.ReadJSON(mf, &man); err != nil || man.ItemID == "" {
 			continue
 		}
-		man.Dir = dir
-		found[man.ItemID] = &man
+		man.Dir = filepath.Dir(mf)
+		found[man.Key()] = &man
 	}
 	m.mu.Lock()
 	m.done = found
 	m.mu.Unlock()
 }
 
-func (m *Manager) Get(id string) *Manifest {
+func (m *Manager) Get(id, episodeID string) *Manifest {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.done[id]
+	return m.done[Key(id, episodeID)]
+}
+
+// CoverFor returns a downloaded cover for a book or podcast, if any.
+func (m *Manager) CoverFor(itemID string) string {
+	m.mu.Lock()
+	var dirs []string
+	for _, man := range m.done {
+		if man.ItemID == itemID {
+			dirs = append(dirs, man.CoverPath())
+		}
+	}
+	m.mu.Unlock()
+	for _, p := range dirs {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 func (m *Manager) Completed() []*Manifest {
@@ -137,11 +165,11 @@ func (m *Manager) Jobs() []Job {
 	return out
 }
 
-func (m *Manager) JobFor(id string) *Job {
+func (m *Manager) JobFor(id, episodeID string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, j := range m.jobs {
-		if j.ItemID == id {
+		if j.ItemID == id && j.EpisodeID == episodeID {
 			c := *j
 			return &c
 		}
@@ -160,14 +188,14 @@ func (m *Manager) Busy() bool {
 	return false
 }
 
-func (m *Manager) Enqueue(id, title string) {
+func (m *Manager) Enqueue(id, episodeID, title string) {
 	m.mu.Lock()
-	if _, ok := m.done[id]; ok {
+	if _, ok := m.done[Key(id, episodeID)]; ok {
 		m.mu.Unlock()
 		return
 	}
 	for _, j := range m.jobs {
-		if j.ItemID == id {
+		if j.ItemID == id && j.EpisodeID == episodeID {
 			if j.State == "error" {
 				j.State, j.Error = "queued", ""
 			}
@@ -176,19 +204,20 @@ func (m *Manager) Enqueue(id, title string) {
 			return
 		}
 	}
-	m.jobs = append(m.jobs, &Job{ItemID: id, Title: title, State: "queued"})
+	m.jobs = append(m.jobs, &Job{ItemID: id, EpisodeID: episodeID, Title: title, State: "queued"})
 	m.mu.Unlock()
 	m.kick()
 }
 
 // Cancel removes a queued or running job and its partial files.
-func (m *Manager) Cancel(id string) {
+func (m *Manager) Cancel(id, episodeID string) {
+	key := Key(id, episodeID)
 	m.mu.Lock()
-	if m.activeID == id && m.cancel != nil {
+	if m.activeID == key && m.cancel != nil {
 		m.cancel()
 	}
 	for i, j := range m.jobs {
-		if j.ItemID == id {
+		if j.ItemID == id && j.EpisodeID == episodeID {
 			m.jobs = append(m.jobs[:i], m.jobs[i+1:]...)
 			break
 		}
@@ -196,11 +225,12 @@ func (m *Manager) Cancel(id string) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) Delete(id string) error {
-	m.Cancel(id)
+func (m *Manager) Delete(id, episodeID string) error {
+	m.Cancel(id, episodeID)
+	key := Key(id, episodeID)
 	m.mu.Lock()
-	man := m.done[id]
-	delete(m.done, id)
+	man := m.done[key]
+	delete(m.done, key)
 	m.mu.Unlock()
 	if man == nil {
 		return nil
@@ -236,7 +266,7 @@ func (m *Manager) worker() {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.mu.Lock()
 		j.State = "downloading"
-		m.cancel, m.activeID = cancel, j.ItemID
+		m.cancel, m.activeID = cancel, Key(j.ItemID, j.EpisodeID)
 		m.mu.Unlock()
 
 		man, err := m.download(ctx, j)
@@ -245,7 +275,7 @@ func (m *Manager) worker() {
 		m.mu.Lock()
 		m.cancel, m.activeID = nil, ""
 		if err == nil {
-			m.done[man.ItemID] = man
+			m.done[man.Key()] = man
 			for i, x := range m.jobs {
 				if x == j {
 					m.jobs = append(m.jobs[:i], m.jobs[i+1:]...)
@@ -290,52 +320,82 @@ func (m *Manager) download(ctx context.Context, j *Job) (*Manifest, error) {
 		return nil, err
 	}
 	md := item.Media.Metadata
-	if len(item.Media.Tracks) == 0 {
-		return nil, errors.New("book has no audio tracks")
+	short := func(id string) string {
+		if len(id) > 8 {
+			return id[len(id)-8:]
+		}
+		return id
+	}
+
+	var man *Manifest
+	var tracks []abs.AudioTrack
+	var folder string
+	if j.EpisodeID != "" {
+		var ep *abs.Episode
+		for i := range item.Media.Episodes {
+			if item.Media.Episodes[i].ID == j.EpisodeID {
+				ep = &item.Media.Episodes[i]
+			}
+		}
+		if ep == nil || ep.AudioTrack == nil {
+			return nil, errors.New("episode has no audio")
+		}
+		tracks = []abs.AudioTrack{*ep.AudioTrack}
+		tracks[0].StartOffset = 0
+		if tracks[0].Duration <= 0 {
+			tracks[0].Duration = ep.Length()
+		}
+		man = &Manifest{
+			ItemID: j.ItemID, EpisodeID: j.EpisodeID, Title: ep.Title, Subtitle: ep.Subtitle,
+			Author: md.Title, Description: ep.Description, Duration: ep.Length(), PublishedAt: ep.PublishedAt,
+		}
+		for _, c := range ep.Chapters {
+			man.Chapters = append(man.Chapters, player.Chapter{Start: c.Start, End: c.End, Title: c.Title})
+		}
+		folder = filepath.Join("Podcasts", sanitize(md.Title)+" ["+short(j.ItemID)+"]", sanitize(ep.Title)+" ["+short(j.EpisodeID)+"]")
+	} else {
+		if len(item.Media.Tracks) == 0 {
+			return nil, errors.New("book has no audio tracks")
+		}
+		tracks = item.Media.Tracks
+		man = &Manifest{
+			ItemID: j.ItemID, Title: md.Title, Subtitle: md.Subtitle, Author: item.Author(),
+			Narrator: md.NarratorName, Series: md.SeriesName, Description: md.Description,
+			Year: md.PublishedYear, Duration: item.Media.Duration,
+		}
+		if man.Narrator == "" {
+			man.Narrator = strings.Join(md.Narrators, ", ")
+		}
+		if man.Series == "" && len(md.Series) > 0 {
+			man.Series = md.Series[0].Name
+			if md.Series[0].Sequence != "" {
+				man.Series += " #" + md.Series[0].Sequence
+			}
+		}
+		for _, c := range item.Media.Chapters {
+			man.Chapters = append(man.Chapters, player.Chapter{Start: c.Start, End: c.End, Title: c.Title})
+		}
+		folder = sanitize(md.Title)
+		if a := item.Author(); a != "" {
+			folder = sanitize(a) + " - " + folder
+		}
+		folder += " [" + short(j.ItemID) + "]"
 	}
 	m.mu.Lock()
-	j.Title = md.Title
+	j.Title = man.Title
 	m.mu.Unlock()
 
-	short := j.ItemID
-	if len(short) > 8 {
-		short = short[len(short)-8:]
-	}
-	folder := sanitize(md.Title)
-	if md.AuthorName != "" {
-		folder = sanitize(md.AuthorName) + " - " + folder
-	}
-	dir := filepath.Join(m.root(), folder+" ["+short+"]")
+	dir := filepath.Join(m.root(), folder)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-
-	man := &Manifest{
-		ItemID: j.ItemID, Title: md.Title, Subtitle: md.Subtitle, Author: md.AuthorName,
-		Narrator: md.NarratorName, Series: md.SeriesName, Description: md.Description,
-		Year: md.PublishedYear, Duration: item.Media.Duration, Dir: dir,
-	}
-	if man.Author == "" && len(md.Authors) > 0 {
-		man.Author = md.Authors[0].Name
-	}
-	if man.Narrator == "" {
-		man.Narrator = strings.Join(md.Narrators, ", ")
-	}
-	if man.Series == "" && len(md.Series) > 0 {
-		man.Series = md.Series[0].Name
-		if md.Series[0].Sequence != "" {
-			man.Series += " #" + md.Series[0].Sequence
-		}
-	}
-	for _, c := range item.Media.Chapters {
-		man.Chapters = append(man.Chapters, player.Chapter{Start: c.Start, End: c.End, Title: c.Title})
-	}
+	man.Dir = dir
 
 	var total, got int64
-	for _, t := range item.Media.Tracks {
+	for _, t := range tracks {
 		total += t.Metadata.Size
 	}
-	for i, t := range item.Media.Tracks {
+	for i, t := range tracks {
 		ext := t.Metadata.Ext
 		if ext == "" {
 			ext = filepath.Ext(t.Metadata.Filename)
@@ -345,7 +405,7 @@ func (m *Manager) download(ctx context.Context, j *Job) (*Manifest, error) {
 			if total > 0 {
 				m.setProgress(j, float64(got+done)/float64(total))
 			} else {
-				m.setProgress(j, float64(i)/float64(len(item.Media.Tracks)))
+				m.setProgress(j, float64(i)/float64(len(tracks)))
 			}
 		})
 		if err != nil {

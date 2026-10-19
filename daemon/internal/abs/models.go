@@ -13,11 +13,19 @@ type User struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-// Me is GET /api/me; only the progress list is used.
+// Me is GET /api/me.
 type Me struct {
 	ID            string          `json:"id"`
 	Username      string          `json:"username"`
 	MediaProgress []MediaProgress `json:"mediaProgress"`
+	Bookmarks     []Bookmark      `json:"bookmarks"`
+}
+
+type Bookmark struct {
+	LibraryItemID string  `json:"libraryItemId"`
+	Time          float64 `json:"time"`
+	Title         string  `json:"title"`
+	CreatedAt     int64   `json:"createdAt"`
 }
 
 type loginResponse struct {
@@ -44,6 +52,7 @@ type Metadata struct {
 	Title         string     `json:"title"`
 	Subtitle      string     `json:"subtitle"`
 	AuthorName    string     `json:"authorName"`
+	Author        string     `json:"author"` // podcasts
 	Authors       []NamedRef `json:"authors"`
 	NarratorName  string     `json:"narratorName"`
 	Narrators     []string   `json:"narrators"`
@@ -51,6 +60,7 @@ type Metadata struct {
 	Series        seriesList `json:"series"`
 	Description   string     `json:"description"`
 	PublishedYear string     `json:"publishedYear"`
+	ReleaseDate   string     `json:"releaseDate"`
 	Publisher     string     `json:"publisher"`
 	Genres        []string   `json:"genres"`
 }
@@ -102,6 +112,44 @@ type AudioTrack struct {
 	Metadata    FileMetadata `json:"metadata"`
 }
 
+type AudioFile struct {
+	Duration float64      `json:"duration"`
+	Metadata FileMetadata `json:"metadata"`
+}
+
+type Episode struct {
+	ID            string      `json:"id"`
+	LibraryItemID string      `json:"libraryItemId"`
+	Title         string      `json:"title"`
+	Subtitle      string      `json:"subtitle"`
+	Description   string      `json:"description"`
+	PubDate       string      `json:"pubDate"`
+	PublishedAt   int64       `json:"publishedAt"`
+	Season        string      `json:"season"`
+	Episode       string      `json:"episode"`
+	Duration      float64     `json:"duration"`
+	AudioFile     *AudioFile  `json:"audioFile"`
+	AudioTrack    *AudioTrack `json:"audioTrack"`
+	Chapters      []Chapter   `json:"chapters"`
+	// Set on recent-episodes results.
+	Podcast *struct {
+		Metadata Metadata `json:"metadata"`
+	} `json:"podcast"`
+}
+
+// Length is the episode duration, wherever the server put it.
+func (e Episode) Length() float64 {
+	switch {
+	case e.Duration > 0:
+		return e.Duration
+	case e.AudioTrack != nil && e.AudioTrack.Duration > 0:
+		return e.AudioTrack.Duration
+	case e.AudioFile != nil:
+		return e.AudioFile.Duration
+	}
+	return 0
+}
+
 type Media struct {
 	Metadata    Metadata     `json:"metadata"`
 	Duration    float64      `json:"duration"`
@@ -109,12 +157,15 @@ type Media struct {
 	Tracks      []AudioTrack `json:"tracks"`
 	NumTracks   int          `json:"numTracks"`
 	NumChapters int          `json:"numChapters"`
+	NumEpisodes int          `json:"numEpisodes"`
+	Episodes    []Episode    `json:"episodes"`
 	CoverPath   string       `json:"coverPath"`
 }
 
 type MediaProgress struct {
 	ID            string  `json:"id"`
 	LibraryItemID string  `json:"libraryItemId"`
+	EpisodeID     string  `json:"episodeId"`
 	Duration      float64 `json:"duration"`
 	Progress      float64 `json:"progress"`
 	CurrentTime   float64 `json:"currentTime"`
@@ -128,7 +179,23 @@ type LibraryItem struct {
 	MediaType         string         `json:"mediaType"`
 	Media             Media          `json:"media"`
 	UserMediaProgress *MediaProgress `json:"userMediaProgress"`
+	RecentEpisode     *Episode       `json:"recentEpisode"`
 	UpdatedAt         int64          `json:"updatedAt"`
+}
+
+// Author returns the display author for books and podcasts.
+func (it LibraryItem) Author() string {
+	md := it.Media.Metadata
+	if md.AuthorName != "" {
+		return md.AuthorName
+	}
+	if md.Author != "" {
+		return md.Author
+	}
+	if len(md.Authors) > 0 {
+		return md.Authors[0].Name
+	}
+	return ""
 }
 
 type ItemsPage struct {
@@ -138,14 +205,75 @@ type ItemsPage struct {
 	Page    int           `json:"page"`
 }
 
-type searchResponse struct {
-	Book []struct {
-		LibraryItem LibraryItem `json:"libraryItem"`
-	} `json:"book"`
+type Series struct {
+	ID    string        `json:"id"`
+	Name  string        `json:"name"`
+	Books []LibraryItem `json:"books"`
+}
+
+type seriesPage struct {
+	Results []Series `json:"results"`
+	Total   int      `json:"total"`
+}
+
+type Author struct {
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	NumBooks     int           `json:"numBooks"`
+	LibraryItems []LibraryItem `json:"libraryItems"`
+}
+
+type Collection struct {
+	ID    string        `json:"id"`
+	Name  string        `json:"name"`
+	Books []LibraryItem `json:"books"`
+}
+
+type collectionsPage struct {
+	Results []Collection `json:"results"`
+	Total   int          `json:"total"`
+}
+
+type PlaylistItem struct {
+	LibraryItemID string       `json:"libraryItemId"`
+	EpisodeID     string       `json:"episodeId"`
+	LibraryItem   *LibraryItem `json:"libraryItem"`
+	Episode       *Episode     `json:"episode"`
+}
+
+type Playlist struct {
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Items []PlaylistItem `json:"items"`
+}
+
+type playlistsPage struct {
+	Results []Playlist `json:"results"`
+	Total   int        `json:"total"`
+}
+
+type itemHit struct {
+	LibraryItem LibraryItem `json:"libraryItem"`
+}
+
+type SearchResult struct {
+	Book    []itemHit `json:"book"`
+	Podcast []itemHit `json:"podcast"`
+	// Episode hits carry the podcast item with recentEpisode set.
+	Episodes []itemHit `json:"episodes"`
+	Series   []struct {
+		Series Series        `json:"series"`
+		Books  []LibraryItem `json:"books"`
+	} `json:"series"`
+	Authors []Author `json:"authors"`
 }
 
 type itemsInProgressResponse struct {
 	LibraryItems []LibraryItem `json:"libraryItems"`
+}
+
+type recentEpisodesResponse struct {
+	Episodes []Episode `json:"episodes"`
 }
 
 type DeviceInfo struct {
@@ -159,6 +287,8 @@ type DeviceInfo struct {
 type PlaySession struct {
 	ID            string       `json:"id"`
 	LibraryItemID string       `json:"libraryItemId"`
+	EpisodeID     string       `json:"episodeId"`
+	MediaType     string       `json:"mediaType"`
 	DisplayTitle  string       `json:"displayTitle"`
 	DisplayAuthor string       `json:"displayAuthor"`
 	CurrentTime   float64      `json:"currentTime"`
@@ -172,6 +302,7 @@ type PlaySession struct {
 type LocalSession struct {
 	ID            string     `json:"id"`
 	LibraryItemID string     `json:"libraryItemId"`
+	EpisodeID     string     `json:"episodeId,omitempty"`
 	MediaType     string     `json:"mediaType"`
 	DisplayTitle  string     `json:"displayTitle"`
 	DisplayAuthor string     `json:"displayAuthor"`

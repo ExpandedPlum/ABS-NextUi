@@ -7,6 +7,7 @@ The Audiobookshelf pak bundles the following:
 | [Apostrophe](https://github.com/Helaas/Apostrophe) | UI toolkit (header-only, vendored in `ui/third_party/apostrophe`) | MIT, see `apostrophe-MIT.txt` |
 | [cJSON](https://github.com/DaveGamble/cJSON) v1.7.18 | JSON parsing in the UI | MIT, see `cjson-MIT.txt` |
 | [FFmpeg](https://ffmpeg.org) 7.1.2 | Audio decoding and output (`bin/ffmpeg`) | LGPL-2.1-or-later |
+| [go-qrcode](https://github.com/skip2/go-qrcode) | QR code for phone sign-in | MIT |
 | [Go x/crypto x509roots/fallback](https://pkg.go.dev/golang.org/x/crypto/x509roots/fallback) | Mozilla CA bundle for HTTPS when the device has none | BSD-3-Clause |
 
 FFmpeg is built from the unmodified upstream source release
