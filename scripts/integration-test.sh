@@ -86,10 +86,16 @@ echo "== stream, seek, chapters"
 "$WORK/absd" ctl play "{\"id\":\"$CH\",\"position\":55}" >/dev/null || fail play
 sleep 7
 [ "$(status 'd["player"]["chapterIndex"]')" = "1" ] || fail "expected chapter 2 after crossing 60s"
+"$WORK/absd" ctl transition '{"seconds":3.5}' >/dev/null || fail transition
+[ "$(status 'd["player"]["state"]')" = "paused" ] || fail "not held for app switch"
+P1=$(status 'd["player"]["position"]')
+sleep 4.5
+[ "$(status 'd["player"]["state"]')" = "playing" ] || fail "did not resume after app switch"
+[ "$(status "int(d['player']['position'] >= $P1)")" = "1" ] || fail "rewound after app switch"
 "$WORK/absd" ctl pause >/dev/null
 "$WORK/absd" ctl sync >/dev/null
 POS=$(curl -fs "$B/api/me/progress/$CH" -H "Authorization: Bearer $TOK" | pjson 'int(d["currentTime"])')
-[ "$POS" -ge 58 ] && [ "$POS" -le 66 ] || fail "server progress $POS, expected ~61"
+[ "$POS" -ge 61 ] && [ "$POS" -le 69 ] || fail "server progress $POS, expected ~64"
 
 echo "== multi-file track change and finish"
 "$WORK/absd" ctl play "{\"id\":\"$MULTI\",\"position\":27}" >/dev/null || fail play2

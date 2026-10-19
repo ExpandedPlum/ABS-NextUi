@@ -54,6 +54,9 @@ play a game**. Podcasts work too.
   while a book is playing; pause the book and game sound comes back. FN2
   toggles game sound on/off while you listen. The audiobook's volume isn't
   affected.
+- **Quiet app switches**: the book pauses for about 3 seconds whenever a game
+  or pak starts or exits, then picks up where it stopped. (Every NextUI app
+  sets the speaker to full volume for a moment as it starts.)
 - Progress is saved automatically before the device sleeps or shuts down.
 
 ## Install
@@ -163,6 +166,10 @@ e.g. `"toggle": "FN2,SELECT+Y"`.
   someone else's file, so game volume control is unavailable then.
 - A NextUI `pre-sleep.d` hook (`.userdata/tg5040/.hooks/pre-sleep.d/`)
   pauses and syncs before the device suspends.
+- `pre-launch.d` and `post-launch.d` hooks hold the book for 3 seconds
+  around each app switch, because NextUI's settings library sets
+  `digital volume` to 100% for a moment whenever an app starts. Games stay
+  muted during the hold. Opening this pak doesn't pause the book.
 
 Files on the SD card:
 
@@ -184,9 +191,11 @@ A quick check after changes that touch the device side:
    returns while paused).
 3. `adb shell amixer -c audiocodec cget name="'ABS Game Volume'"` shows
    `values=0,0` while a book plays and `255,255` while it's paused.
-4. Sleep the device during playback: it pauses, and the position reaches the
+4. Start and quit a game, and open another pak, while a book plays: the book
+   pauses briefly each time and resumes with no loud blip.
+5. Sleep the device during playback: it pauses, and the position reaches the
    server.
-5. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
+6. Download a book, turn Wi-Fi off, listen, turn Wi-Fi on: the server catches
    up within a minute.
 
 Logs: `.userdata/tg5040/logs/Audiobookshelf-daemon.txt` (service) and

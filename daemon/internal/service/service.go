@@ -78,6 +78,8 @@ type Service struct {
 	gameErr     string
 	gameChecked time.Time
 	gameRetry   time.Time // don't retry a failed volume change before this
+
+	trans *time.Timer // pending resume after an app switch (TransitionPause)
 }
 
 // OnSettings registers a callback run after settings change.
@@ -208,7 +210,13 @@ func (s *Service) Run() {
 				lastFlush = now
 				go s.flushPending()
 			}
-			s.reconcileGameAudio(snap.State, now)
+			state := snap.State
+			if s.inTransition() {
+				// Keep games turned down while the book is held for an app
+				// switch, so the new game's first sounds don't leak through.
+				state = player.StatePlaying
+			}
+			s.reconcileGameAudio(state, now)
 			if snap.State == player.StatePlaying || snap.State == player.StateLoading || s.DL.Busy() || s.uiActive() {
 				s.mu.Lock()
 				s.lastBusy = now
@@ -358,6 +366,7 @@ func (c *current) key() string { return downloads.Key(c.itemID, c.episodeID) }
 
 // Play starts a book, or a podcast episode when episodeID is set.
 func (s *Service) Play(ctx context.Context, itemID, episodeID string, from *float64) error {
+	s.endTransition()
 	s.mu.Lock()
 	cur := s.cur
 	s.mu.Unlock()
@@ -508,6 +517,7 @@ func (s *Service) applyResumeRewind(cur *current) {
 }
 
 func (s *Service) Pause() {
+	s.endTransition()
 	s.Eng.Pause()
 	s.mu.Lock()
 	if s.cur != nil {
@@ -524,11 +534,17 @@ func (s *Service) Resume() error {
 	if cur == nil {
 		return errors.New("nothing is playing")
 	}
-	s.applyResumeRewind(cur)
+	if !s.endTransition() {
+		s.applyResumeRewind(cur)
+	}
 	return s.Eng.Play()
 }
 
 func (s *Service) Toggle() error {
+	if s.inTransition() {
+		s.Pause()
+		return nil
+	}
 	switch s.Eng.Snapshot().State {
 	case player.StatePlaying, player.StateLoading:
 		s.Pause()
@@ -653,6 +669,7 @@ func (s *Service) Stop() {
 	s.mu.Lock()
 	cur := s.cur
 	s.mu.Unlock()
+	s.endTransition()
 	if cur == nil {
 		return
 	}
@@ -823,8 +840,9 @@ func (s *Service) PreSleep() {
 	if !s.St.GetSettings().PauseOnSleep {
 		return
 	}
-	switch s.Eng.Snapshot().State {
-	case player.StatePlaying, player.StateLoading:
+	held := s.endTransition()
+	switch st := s.Eng.Snapshot().State; {
+	case held, st == player.StatePlaying, st == player.StateLoading:
 		s.Eng.Pause()
 		s.mu.Lock()
 		if s.cur != nil {

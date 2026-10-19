@@ -186,6 +186,14 @@ func (s *Service) routes() http.Handler {
 	h("/sync", func(ctx context.Context, r req) (any, error) { s.Sync(false); s.flushPending(); return nil, nil })
 	h("/gameaudio/toggle", func(ctx context.Context, r req) (any, error) { s.Hotkey("gameAudio"); return s.gameAudioStatus(), nil })
 	h("/presleep", func(ctx context.Context, r req) (any, error) { s.PreSleep(); return nil, nil })
+	h("/transition", func(ctx context.Context, r req) (any, error) {
+		d := 3 * time.Second
+		if r.Seconds > 0 && r.Seconds <= 30 {
+			d = time.Duration(r.Seconds * float64(time.Second))
+		}
+		s.TransitionPause(d)
+		return nil, nil
+	})
 
 	h("/download", func(ctx context.Context, r req) (any, error) { return nil, s.QueueDownload(ctx, r.ID, r.Episode) })
 	h("/download/cancel", func(ctx context.Context, r req) (any, error) { s.DL.Cancel(r.ID, r.Episode); return nil, nil })

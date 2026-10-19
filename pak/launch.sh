@@ -33,6 +33,23 @@ exit 0
 EOF
 chmod +x "$HOOK_DIR/audiobookshelf.sync.sh"
 
+# Every NextUI app sets the speaker to full volume for a moment as it starts,
+# which is a loud blip with a book playing. Hold the book for a few seconds
+# around each app switch; it resumes on its own. This UI doesn't do that
+# reset, so opening it doesn't pause the book.
+for phase in pre-launch.d post-launch.d; do
+	HOOK_DIR="$USERDATA_PATH/.hooks/$phase"
+	mkdir -p "$HOOK_DIR"
+	cat > "$HOOK_DIR/audiobookshelf.sync.sh" <<EOF
+#!/bin/sh
+[ -S /tmp/absd.sock ] || exit 0
+[ "\$HOOK_PHASE" = pre ] && case "\$HOOK_EMU_PATH" in */$PAK_NAME.pak/*) exit 0 ;; esac
+"$ABSD" ctl transition '{"seconds":3}' >/dev/null 2>&1
+exit 0
+EOF
+	chmod +x "$HOOK_DIR/audiobookshelf.sync.sh"
+done
+
 # All daemon output (including Go runtime crashes) goes to its log.
 if ! "$ABSD" ctl status >/dev/null 2>&1; then
 	echo "launch.sh: starting $ABSD ($(uname -m), kernel $(uname -r))" >"$DAEMON_LOG"
