@@ -1,6 +1,6 @@
 {
   "name": "Audiobookshelf",
-  "version": "v0.2.0",
+  "version": "0.2.0",
   "type": "TOOL",
   "description": "Listen to audiobooks and podcasts from your Audiobookshelf server, with the screen off or while you play games.",
   "author": "ExpandedPlum",

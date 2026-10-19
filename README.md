@@ -185,15 +185,36 @@ Things that still need confirming on real hardware, in rough priority order:
 
 ## Building
 
-Requirements: Go 1.26+ and Docker. The NextUI toolchain image
+Requirements: Go 1.26+, Docker, `jq` and `zip`. The NextUI toolchain image
 `ghcr.io/loveretro/tg5040-toolchain` is pulled automatically.
 
 ```sh
-make            # → dist/Audiobookshelf.pak.zip
-make daemon     # build/tg5040/absd    (static arm64 Go binary)
-make ui         # build/tg5040/abs-ui  (C, built in the toolchain container)
-make ffmpeg     # build/tg5040/ffmpeg  (see scripts/build-ffmpeg.sh)
+make build      # build/tg5040/{absd,abs-ui,ffmpeg}
+make release    # → dist/Audiobookshelf.pak.zip
+make push       # release, then adb push to Tools/tg5040/ on a connected Brick
+make lint test  # gofmt/vet and unit tests
 ```
+
+`RELEASE_VERSION=x.y.z make release` stamps that version into `pak.json` and
+the daemon. It updates `pak/pak.json` in place, like the release workflow.
+
+### Releases
+
+This repo uses the same release flow as
+[the Music Player pak](https://github.com/ExpandedPlum/trimui-brick-music-player-with-scrobbling-pak):
+
+- **ci** runs lint, unit tests and the Docker integration test on every pull
+  request and push to `main`. It then builds a `0.0.0-dev` pak and uploads
+  it as a workflow artifact, with build provenance attested.
+- **release** is started by hand from the Actions tab (*Run workflow*). You
+  pick a patch/minor/major bump; it then:
+  1. computes the next version from the latest tag (or from `pak.json` if
+     there are no tags yet);
+  2. runs the tests and builds the pak;
+  3. commits the new version to `pak/pak.json` and tags it;
+  4. publishes a GitHub release with `Audiobookshelf.pak.zip` and generated
+     release notes.
+- **Dependabot** keeps the GitHub Actions and Go modules up to date.
 
 ### Desktop development
 

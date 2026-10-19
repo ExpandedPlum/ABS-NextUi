@@ -23,7 +23,8 @@ import (
 	"github.com/ExpandedPlum/ABS-NextUi/daemon/internal/store"
 )
 
-const Version = "0.2.0"
+// Version is set at build time (-ldflags -X …service.Version=…).
+var Version = "dev"
 
 type current struct {
 	itemID        string

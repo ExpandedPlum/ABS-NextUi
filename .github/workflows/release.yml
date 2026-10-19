@@ -1,0 +1,174 @@
+---
+name: "release"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Bump type"
+        default: "patch"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  attestations: write
+  id-token: write
+  contents: write
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.next-tag.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Get Latest Tag
+        id: latest-tag
+        # Before the first release there are no tags; start from pak.json.
+        run: |
+          latest="$(git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || true)"
+          if [ -z "$latest" ]; then
+            latest="$(jq -r .version pak/pak.json)"
+          fi
+          echo GIT_LATEST_TAG="$latest" >>"$GITHUB_OUTPUT"
+
+      - name: Compute Next Tag
+        id: next-tag
+        uses: docker://ghcr.io/dokku/semver-generator:latest
+        with:
+          bump: ${{ github.event.inputs.bump_type }}
+          input: ${{ steps.latest-tag.outputs.GIT_LATEST_TAG }}
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: daemon/go.mod
+          cache-dependency-path: daemon/go.sum
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+      - name: Integration test (real Audiobookshelf server in Docker)
+        run: make test-integration
+
+  build:
+    name: build
+    # The NextUI toolchain image is x86_64, so build on an x86 runner.
+    runs-on: ubuntu-24.04
+    needs:
+      - version
+      - test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: daemon/go.mod
+          cache-dependency-path: daemon/go.sum
+
+      - name: Cache ffmpeg source
+        uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-work/*.tar.xz
+          key: ffmpeg-src-7.1.2
+
+      - name: Create release
+        run: make clean release
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+
+      - name: Get Pak Name
+        id: pak-name
+        run: |
+          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v3.2.0
+        with:
+          subject-path: "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: "${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+          path: "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    needs:
+      - version
+      - build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Get Pak Name
+        id: pak-name
+        run: |
+          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: "${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+          path: "dist"
+
+      - name: Validate Artifact exists
+        run: |
+          if [ ! -f "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip" ]; then
+            echo "Artifact does not exist"
+            exit 1
+          fi
+
+      - name: Create and Push Tag
+        run: |
+          make bump-version
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add pak/pak.json
+          git commit -m "Release $RELEASE_VERSION"
+          git tag "$RELEASE_VERSION"
+          git push origin "$RELEASE_VERSION"
+          git push origin "HEAD:${{ github.ref_name }}"
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          files: dist/*
+          generate_release_notes: true
+          make_latest: "true"
+          tag_name: ${{ needs.version.outputs.version }}

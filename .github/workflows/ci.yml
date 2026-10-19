@@ -1,0 +1,119 @@
+---
+name: "ci"
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - main
+
+permissions:
+  attestations: write
+  id-token: write
+  contents: write
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: daemon/go.mod
+          cache-dependency-path: daemon/go.sum
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test
+
+      - name: Integration test (real Audiobookshelf server in Docker)
+        run: make test-integration
+
+  build:
+    name: build
+    # The NextUI toolchain image is x86_64, so build on an x86 runner.
+    runs-on: ubuntu-24.04
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: daemon/go.mod
+          cache-dependency-path: daemon/go.sum
+
+      - name: Cache ffmpeg source
+        uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-work/*.tar.xz
+          key: ffmpeg-src-7.1.2
+
+      - name: Create release
+        run: make clean release
+        env:
+          RELEASE_VERSION: "0.0.0-dev"
+
+      - name: Get Pak Name
+        id: pak-name
+        run: |
+          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v3.2.0
+        with:
+          subject-path: "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: "${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+          path: "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+
+  test-release:
+    name: test-release
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Get Pak Name
+        id: pak-name
+        run: |
+          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v6.0.0
+        with:
+          name: "${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+          path: "dist"
+
+      - name: Validate Artifact exists
+        run: |
+          zip="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
+          if [ ! -f "$zip" ]; then
+            echo "Artifact does not exist"
+            exit 1
+          fi
+          for f in launch.sh pak.json bin/absd bin/abs-ui bin/ffmpeg; do
+            unzip -l "$zip" | grep -q "${{ steps.pak-name.outputs.PAK_NAME }}.pak/$f" || { echo "missing $f"; exit 1; }
+          done

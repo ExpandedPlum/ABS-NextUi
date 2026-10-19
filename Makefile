@@ -1,19 +1,26 @@
 # Audiobookshelf.pak for NextUI (TrimUI Brick / Smart Pro, platform tg5040)
 #
-#   make            build everything and package dist/Audiobookshelf.pak.zip
-#   make daemon     absd (Go, static arm64)
-#   make ui         abs-ui (C/SDL2, built in the NextUI toolchain container)
-#   make ffmpeg     minimal audio-only ffmpeg (toolchain container)
+#   make build      build absd, abs-ui and ffmpeg for the device
+#   make release    build and package dist/Audiobookshelf.pak.zip
+#                   (RELEASE_VERSION=x.y.z stamps that version into pak.json)
+#   make push       release, then install on a Brick connected over adb
+#   make lint test  go vet + unit tests (test-integration needs Docker)
 #   make desktop    build UI + daemon for this machine, for testing
 #   make clean
 #
-# Requires Go and Docker.
+# Requires Go, Docker, jq and zip.
 
-PAK_NAME   := Audiobookshelf
-PLATFORM   := tg5040
-TOOLCHAIN  ?= ghcr.io/loveretro/tg5040-toolchain:latest
+PAK_NAME   := $(shell jq -r .name pak/pak.json)
+PAK_TYPE   := $(shell jq -r .type pak/pak.json)
+PAK_FOLDER := $(shell echo $(PAK_TYPE) | cut -c1)$(shell echo $(PAK_TYPE) | tr '[:upper:]' '[:lower:]' | cut -c2-)s
+RELEASE_VERSION ?= $(shell jq -r .version pak/pak.json)
+
+PLATFORM  := tg5040
+TOOLCHAIN ?= ghcr.io/loveretro/tg5040-toolchain:latest
 FFMPEG_VERSION ?= 7.1.2
-VERSION    := $(shell sed -n 's/.*"version": *"v\{0,1\}\([^"]*\)".*/\1/p' pak/pak.json)
+
+PUSH_SDCARD_PATH ?= /mnt/SDCARD
+PUSH_PLATFORM ?= tg5040
 
 BUILD := build
 DIST  := dist
@@ -22,15 +29,18 @@ PAK   := $(DIST)/$(PAK_NAME).pak
 
 DOCKER_RUN := docker run --rm -u $(shell id -u):$(shell id -g) -v "$(CURDIR)":/src -w /src
 
-.PHONY: all daemon ui ffmpeg pak desktop clean
+.PHONY: all build daemon ui ffmpeg release bump-version push lint test test-integration desktop clean
 
-all: pak
+all: release
 
-daemon: $(DEV)/absd
-$(DEV)/absd: $(shell find daemon -name '*.go') daemon/go.mod daemon/go.sum
+build: daemon ui ffmpeg
+
+# Always rebuilt so the embedded version matches RELEASE_VERSION.
+daemon:
 	@mkdir -p $(DEV)
 	cd daemon && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
-		-ldflags "-s -w" -o ../$@ .
+		-ldflags "-s -w -X github.com/ExpandedPlum/ABS-NextUi/daemon/internal/service.Version=$(RELEASE_VERSION)" \
+		-o ../$(DEV)/absd .
 
 ui: $(DEV)/abs-ui
 $(DEV)/abs-ui: $(wildcard ui/src/*) ui/Makefile
@@ -46,16 +56,34 @@ $(DEV)/ffmpeg: scripts/build-ffmpeg.sh
 	$(DOCKER_RUN) -e WORK=/src/$(BUILD)/ffmpeg-work -e FFMPEG_VERSION=$(FFMPEG_VERSION) \
 		$(TOOLCHAIN) sh scripts/build-ffmpeg.sh /src/$(DEV)
 
-pak: daemon ui ffmpeg
+release: build bump-version
 	rm -rf $(PAK) $(DIST)/$(PAK_NAME).pak.zip
 	mkdir -p $(PAK)/bin
 	cp pak/launch.sh pak/pak.json $(PAK)/
 	cp $(DEV)/absd $(DEV)/abs-ui $(DEV)/ffmpeg $(PAK)/bin/
-	cp LICENSE $(PAK)/ 2>/dev/null || true
-	cp -r licenses $(PAK)/ 2>/dev/null || true
+	cp -r licenses $(PAK)/
 	chmod +x $(PAK)/launch.sh $(PAK)/bin/*
-	cd $(DIST) && rm -f $(PAK_NAME).pak.zip && zip -qr $(PAK_NAME).pak.zip $(PAK_NAME).pak
-	@echo "Built $(DIST)/$(PAK_NAME).pak.zip (v$(VERSION))"
+	cd $(DIST) && zip -qr "$(PAK_NAME).pak.zip" "$(PAK_NAME).pak"
+	ls -lah $(DIST)
+
+bump-version:
+	jq '.version = "$(RELEASE_VERSION)"' pak/pak.json > pak/pak.json.tmp
+	mv pak/pak.json.tmp pak/pak.json
+
+# Install on a Brick connected over USB (adb).
+push: release
+	adb push "$(PAK)/." "$(PUSH_SDCARD_PATH)/$(PAK_FOLDER)/$(PUSH_PLATFORM)/$(PAK_NAME).pak"
+
+lint:
+	cd daemon && test -z "$$(gofmt -l .)" && go vet ./...
+	for f in pak/launch.sh scripts/build-ffmpeg.sh scripts/integration-test.sh; do sh -n "$$f" || exit 1; done
+
+test:
+	cd daemon && go test ./...
+
+# Runs the daemon against a real Audiobookshelf server in Docker.
+test-integration:
+	scripts/integration-test.sh
 
 desktop:
 	$(MAKE) -C ui desktop OUT=../$(BUILD)
