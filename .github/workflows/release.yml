@@ -39,7 +39,7 @@ jobs:
         run: |
           latest="$(git describe --tags "$(git rev-list --tags --max-count=1)" 2>/dev/null || true)"
           if [ -z "$latest" ]; then
-            latest="$(jq -r .version pak/pak.json)"
+            latest="$(jq -r .version pak.json)"
           fi
           echo GIT_LATEST_TAG="$latest" >>"$GITHUB_OUTPUT"
 
@@ -108,7 +108,7 @@ jobs:
       - name: Get Pak Name
         id: pak-name
         run: |
-          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+          echo "PAK_NAME=$(jq -r .name pak.json)" >> $GITHUB_OUTPUT
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v3.2.0
@@ -137,7 +137,7 @@ jobs:
       - name: Get Pak Name
         id: pak-name
         run: |
-          echo "PAK_NAME=$(jq -r .name pak/pak.json)" >> $GITHUB_OUTPUT
+          echo "PAK_NAME=$(jq -r .name pak.json)" >> $GITHUB_OUTPUT
 
       - name: Download Artifacts
         uses: actions/download-artifact@v8.0.2
@@ -157,7 +157,7 @@ jobs:
           make bump-version
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add pak/pak.json
+          git add pak.json
           git commit -m "Release $RELEASE_VERSION"
           git tag "$RELEASE_VERSION"
           git push origin "$RELEASE_VERSION"

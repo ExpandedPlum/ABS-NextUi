@@ -64,8 +64,8 @@ play a game**. Podcasts work too.
 ## Install
 
 1. Download `Audiobookshelf.pak.zip` from Releases, or build it (see below).
-2. Unzip it and copy the `Audiobookshelf.pak` folder to
-   `SD:/Tools/tg5040/` on your SD card.
+2. Unzip it into a folder named `SD:/Tools/tg5040/Audiobookshelf.pak/` on your
+   SD card. The zip holds the pak's files directly, not a folder.
 3. On the device, open **Tools → Audiobookshelf**.
 4. Sign in. The easiest way is **Sign in from your phone**: scan the QR code
    with a phone on the same Wi-Fi and fill in the form there. You can also
@@ -226,7 +226,8 @@ make lint test  # gofmt/vet and unit tests
 ```
 
 `RELEASE_VERSION=x.y.z make release` stamps that version into `pak.json` and
-the daemon. It updates `pak/pak.json` in place, like the release workflow.
+the daemon. It updates `pak.json` in place, like the release workflow.
+`pak.json` lives in the repository root, where the Pak Store reads it.
 
 ### Releases
 
@@ -241,7 +242,7 @@ This repo uses the same release flow as
   1. computes the next version from the latest tag (or from `pak.json` if
      there are no tags yet);
   2. runs the tests and builds the pak;
-  3. commits the new version to `pak/pak.json` and tags it;
+  3. commits the new version to `pak.json` and tags it;
   4. publishes a GitHub release with `Audiobookshelf.pak.zip` and generated
      release notes.
 - **Dependabot** keeps the GitHub Actions and Go modules up to date.

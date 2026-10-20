@@ -10,10 +10,10 @@
 #
 # Requires Go, Docker, jq and zip.
 
-PAK_NAME   := $(shell jq -r .name pak/pak.json)
-PAK_TYPE   := $(shell jq -r .type pak/pak.json)
+PAK_NAME   := $(shell jq -r .name pak.json)
+PAK_TYPE   := $(shell jq -r .type pak.json)
 PAK_FOLDER := $(shell echo $(PAK_TYPE) | cut -c1)$(shell echo $(PAK_TYPE) | tr '[:upper:]' '[:lower:]' | cut -c2-)s
-RELEASE_VERSION ?= $(shell jq -r .version pak/pak.json)
+RELEASE_VERSION ?= $(shell jq -r .version pak.json)
 
 PLATFORM  := tg5040
 TOOLCHAIN ?= ghcr.io/loveretro/tg5040-toolchain:latest
@@ -56,19 +56,21 @@ $(DEV)/ffmpeg: scripts/build-ffmpeg.sh
 	$(DOCKER_RUN) -e WORK=/src/$(BUILD)/ffmpeg-work -e FFMPEG_VERSION=$(FFMPEG_VERSION) \
 		$(TOOLCHAIN) sh scripts/build-ffmpeg.sh /src/$(DEV)
 
+# The pak's files go at the zip's root: the Pak Store unzips the release
+# into Tools/tg5040/$(PAK_NAME).pak/.
 release: build bump-version
 	rm -rf $(PAK) $(DIST)/$(PAK_NAME).pak.zip
 	mkdir -p $(PAK)/bin
-	cp pak/launch.sh pak/pak.json $(PAK)/
+	cp pak/launch.sh pak.json $(PAK)/
 	cp $(DEV)/absd $(DEV)/abs-ui $(DEV)/ffmpeg $(PAK)/bin/
 	cp -r licenses $(PAK)/
 	chmod +x $(PAK)/launch.sh $(PAK)/bin/*
-	cd $(DIST) && zip -qr "$(PAK_NAME).pak.zip" "$(PAK_NAME).pak"
+	cd $(PAK) && zip -qr "../$(PAK_NAME).pak.zip" .
 	ls -lah $(DIST)
 
 bump-version:
-	jq '.version = "$(RELEASE_VERSION)"' pak/pak.json > pak/pak.json.tmp
-	mv pak/pak.json.tmp pak/pak.json
+	jq '.version = "$(RELEASE_VERSION)"' pak.json > pak.json.tmp
+	mv pak.json.tmp pak.json
 
 # Install on a Brick connected over USB (adb).
 push: release
